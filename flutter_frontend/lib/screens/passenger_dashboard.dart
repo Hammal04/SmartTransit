@@ -27,6 +27,11 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
   int?      _selectedRouteId;
   // PKT = UTC+5. Initialise to tomorrow in Pakistan time.
   DateTime  _selectedDate    = DateTime.now().toUtc().add(const Duration(hours: 5, days: 1));
+  // A route can now be served by multiple buses/transports (e.g. Daewoo
+  // Express, Faisal Movers). The passenger must pick one before seats load.
+  List<Map<String, dynamic>> _routeBuses = [];
+  bool      _loadingBuses    = false;
+  int?      _selectedBusId;
   int?      _selectedSeat;
   List<int> _availableSeats  = [];
   List<int> _bookedSeats     = [];
@@ -129,12 +134,33 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
     ));
   }
 
-  // ── Load seat availability for selected route + date ──────────────────────
-  Future<void> _loadSeats() async {
+  // ── Load transports/buses available on the selected route ────────────────
+  Future<void> _loadRouteBuses() async {
     if (_selectedRouteId == null) return;
+    setState(() {
+      _loadingBuses   = true;
+      _selectedBusId  = null;
+      _selectedSeat   = null;
+      _availableSeats = [];
+      _bookedSeats    = [];
+    });
+    final buses = await _api.getRouteBuses(_selectedRouteId!);
+    if (!mounted) return;
+    setState(() {
+      _routeBuses   = buses;
+      _loadingBuses = false;
+    });
+    if (buses.isEmpty) {
+      _snack('No transports are currently assigned to this route.', error: true);
+    }
+  }
+
+  // ── Load seat availability for the selected bus/transport + date ─────────
+  Future<void> _loadSeats() async {
+    if (_selectedBusId == null) return;
     setState(() { _loadingSeats = true; _selectedSeat = null; });
     final dateStr = '${_selectedDate.year}-${_selectedDate.month.toString().padLeft(2,'0')}-${_selectedDate.day.toString().padLeft(2,'0')}';
-    final res = await _api.getSeatAvailability(_selectedRouteId!, dateStr);
+    final res = await _api.getSeatAvailability(_selectedBusId!, dateStr);
     if (!mounted) return;
     setState(() {
       _availableSeats = List<int>.from(res['available'] ?? []);
@@ -162,13 +188,14 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
     );
     if (picked != null && picked != _selectedDate) {
       setState(() => _selectedDate = picked);
-      if (_selectedRouteId != null) await _loadSeats();
+      if (_selectedBusId != null) await _loadSeats();
     }
   }
 
   // ── Book ticket (cash on boarding) ─────────────────────────────────────────
   Future<void> _bookTicket() async {
     if (_selectedRouteId == null) { _snack('Please select a route.', error: true); return; }
+    if (_selectedBusId == null)   { _snack('Please select a transport/bus.', error: true); return; }
     if (_selectedSeat == null)    { _snack('Please select a seat.',  error: true); return; }
 
     // Passenger details (Full Name + Phone Number) must be valid before we
@@ -185,6 +212,7 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
 
     final res = await _api.bookTicket(
       routeId:       _selectedRouteId!,
+      busId:         _selectedBusId!,
       seatNumber:    _selectedSeat!,
       departureDate: dateStr,
       passengerId:   context.read<AuthProvider>().currentUser!.id,
@@ -197,7 +225,8 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
     if (res['status'] == 'success') {
       _snack(res['message'] ?? 'Booking confirmed! Pay cash to the driver.', success: true);
       setState(() {
-        _selectedRouteId = null; _selectedSeat = null; _availableSeats = []; _bookedSeats = [];
+        _selectedRouteId = null; _selectedBusId = null; _routeBuses = [];
+        _selectedSeat = null; _availableSeats = []; _bookedSeats = [];
         _fullNameController.clear();
         _phoneController.clear();
       });
@@ -580,13 +609,34 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
                   );
                 }).toList(),
                 onChanged: (v) async {
-                  setState(() { _selectedRouteId = v; _selectedSeat = null; _availableSeats = []; _bookedSeats = []; });
-                  if (v != null) await _loadSeats();
+                  setState(() {
+                    _selectedRouteId = v;
+                    _selectedBusId = null; _routeBuses = [];
+                    _selectedSeat = null; _availableSeats = []; _bookedSeats = [];
+                  });
+                  if (v != null) await _loadRouteBuses();
                 },
                 decoration: const InputDecoration(labelText: 'Route'),
               ),
               if (_selectedRouteId != null) _buildRouteInfoBox(),
               const SizedBox(height: 12),
+              // Bus/Transport selector — a route can be served by several
+              // buses (e.g. Daewoo Express, Faisal Movers); the passenger
+              // must pick one before seats can be shown.
+              if (_selectedRouteId != null) ...[
+                const Text('Select Transport', style: TextStyle(fontWeight: FontWeight.bold)),
+                const SizedBox(height: 6),
+                _loadingBuses
+                    ? const Center(child: Padding(padding: EdgeInsets.all(12),
+                        child: CircularProgressIndicator()))
+                    : _routeBuses.isEmpty
+                        ? const Padding(
+                            padding: EdgeInsets.symmetric(vertical: 8),
+                            child: Text('No transports available on this route yet.',
+                                style: TextStyle(color: Colors.grey)))
+                        : Column(children: _routeBuses.map(_buildBusOption).toList()),
+                const SizedBox(height: 12),
+              ],
               // Date picker
               InkWell(
                 onTap: _pickDate,
@@ -600,7 +650,7 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
               ),
               const SizedBox(height: 16),
               // Seat grid
-              if (_selectedRouteId != null) ...[
+              if (_selectedBusId != null) ...[
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
@@ -636,12 +686,14 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
                         padding: const EdgeInsets.symmetric(vertical: 14),
                       ),
                       icon: const Icon(Icons.check_circle_outline),
-                      label: Text(_selectedSeat == null
-                          ? 'Select a Seat to Book'
-                          : !_passengerDetailsValid
-                              ? 'Enter Valid Name & Phone Number'
-                              : 'Confirm Seat $_selectedSeat — Pay Cash on Boarding'),
-                      onPressed: (_selectedSeat != null && _passengerDetailsValid)
+                      label: Text(_selectedBusId == null
+                          ? 'Select a Transport'
+                          : _selectedSeat == null
+                              ? 'Select a Seat to Book'
+                              : !_passengerDetailsValid
+                                  ? 'Enter Valid Name & Phone Number'
+                                  : 'Confirm Seat $_selectedSeat — Pay Cash on Boarding'),
+                      onPressed: (_selectedBusId != null && _selectedSeat != null && _passengerDetailsValid)
                           ? _bookTicket
                           : null,
                     ),
@@ -658,23 +710,54 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
     );
   }
 
+  Widget _buildBusOption(Map<String, dynamic> bus) {
+    final busId = bus['id'] as int;
+    final isSelected = _selectedBusId == busId;
+    final transport = bus['transport_name'] ?? 'Unnamed Transport';
+    final number = bus['bus_number'] ?? '-';
+    final driver = bus['driverName'] ?? 'Not assigned';
+    final capacity = bus['capacity'] ?? '-';
+    return Card(
+      margin: const EdgeInsets.only(bottom: 8),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(10),
+        side: BorderSide(color: isSelected ? Colors.blue.shade700 : Colors.transparent, width: 2),
+      ),
+      color: isSelected ? Colors.blue.shade50 : null,
+      child: RadioListTile<int>(
+        value: busId,
+        groupValue: _selectedBusId,
+        onChanged: (v) async {
+          setState(() {
+            _selectedBusId = v;
+            _selectedSeat = null; _availableSeats = []; _bookedSeats = [];
+          });
+          if (v != null) await _loadSeats();
+        },
+        title: Text(transport, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+        subtitle: Text('Bus: $number  •  Driver: $driver  •  Capacity: $capacity',
+            style: const TextStyle(fontSize: 11, color: Colors.grey)),
+      ),
+    );
+  }
+
   Widget _buildRouteInfoBox() {
     final r = _routes.firstWhere((r) => r['id'] == _selectedRouteId, orElse: () => {});
     if (r.isEmpty) return const SizedBox();
     final src  = r['source']         ?? '';
     final dst  = r['destination']    ?? '';
-    final bus  = r['bus_number']     ?? '-';
     final days = r['days_of_week']   ?? 'Daily';
     final dep  = r['departure_time'] ?? '-';
     final arr  = r['arrival_time']?.toString() ?? '';
     final fare = _toDouble(r['fare']);
+    final busCount = (r['busCount'] as int?) ?? _routeBuses.length;
     return Container(
       margin: const EdgeInsets.only(top: 10),
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(color: Colors.blue.shade50, borderRadius: BorderRadius.circular(10)),
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Text('$src → $dst', style: const TextStyle(fontWeight: FontWeight.bold)),
-        Text('Bus: $bus'),
+        Text('$busCount transport${busCount == 1 ? '' : 's'} available on this route'),
         Text('Days: $days', style: const TextStyle(fontWeight: FontWeight.w600, color: Colors.blue)),
         Text('Dep: $dep${arr.isNotEmpty ? "  •  Arr: $arr" : ""}'),
         Text('PKR ${fare.toStringAsFixed(0)} per seat',
@@ -735,7 +818,7 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
     final days = r['days_of_week']   ?? 'Daily';
     final dep  = r['departure_time'] ?? '-';
     final arr  = r['arrival_time']?.toString() ?? '';
-    final bus  = r['bus_number']     ?? '-';
+    final busCount = (r['busCount'] as int?) ?? 0;
     final fare = _toDouble(r['fare']);
     return Card(
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
@@ -747,7 +830,7 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
         title: Text('$src → $dst',
             style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
         subtitle: Text(
-          '$days\nBus: $bus  •  Dep: $dep${arr.isNotEmpty ? "  Arr: $arr" : ""}',
+          '$days\n$busCount transport${busCount == 1 ? '' : 's'} available  •  Dep: $dep${arr.isNotEmpty ? "  Arr: $arr" : ""}',
           style: const TextStyle(fontSize: 11),
         ),
         trailing: Text('PKR ${fare.toStringAsFixed(0)}',
@@ -755,7 +838,7 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
         isThreeLine: true,
         onTap: () async {
           setState(() { _selectedRouteId = r['id'] as int; _tabIndex = 1; });
-          await _loadSeats();
+          await _loadRouteBuses();
         },
       ),
     );
@@ -820,7 +903,9 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
     final dep = routeData?['departure_time'] ?? '-';
     final arr = routeData?['arrival_time']?.toString() ?? '';
 
-    final bus = (routeData?['buses'] as Map<String, dynamic>?)?['bus_number'] ?? '-';
+    final busData = bk['buses'] as Map<String, dynamic>?;
+    final bus = busData?['bus_number'] ?? '-';
+    final transport = busData?['transport_name'] ?? '';
 
     final amount = _toDouble(routeData?['fare']);
     final seat = bk['seat_number'] ?? '-';
@@ -880,7 +965,7 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
             Text(days.toString(),
                 style: const TextStyle(fontSize: 10, color: Colors.blue, fontWeight: FontWeight.w600)),
           Text(
-            'Bus: $bus  •  Seat: $seat  •  Dep: $dep${arr.isNotEmpty ? "  •  Arr: $arr" : ""}',
+            '${transport.toString().isNotEmpty ? "$transport ($bus)" : "Bus: $bus"}  •  Seat: $seat  •  Dep: $dep${arr.isNotEmpty ? "  •  Arr: $arr" : ""}',
             style: const TextStyle(fontSize: 11, color: Colors.grey),
           ),
           if (!compact) ...[

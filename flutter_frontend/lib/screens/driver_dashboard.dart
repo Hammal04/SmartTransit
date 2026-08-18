@@ -65,10 +65,16 @@ Future<int> _getDriverId() async {
 
   // Add Bus form
   final _busNumCtrl = TextEditingController();
+  final _busTransportCtrl = TextEditingController();
   final _busCapCtrl = TextEditingController();
+  int?   _busRouteId;
+
+  // All routes in the system (not just this driver's) — used so a driver
+  // can add a new bus/transport to any existing route, since a route can
+  // now be served by multiple buses/drivers.
+  List<Map<String, dynamic>> _allRoutes = [];
 
   // Add Route form
-  int?   _routeBusId;
   final _routeSrcCtrl  = TextEditingController();
   final _routeDstCtrl  = TextEditingController();
   final _routeTimeCtrl = TextEditingController();
@@ -108,6 +114,7 @@ Future<int> _getDriverId() async {
       _api.getDriverBuses(driverId: driverId),
       _api.getDriverRoutes(driverId: driverId),
       _api.getDriverPassengers(driverId: driverId),
+      _api.getPassengerRoutes(), // all system routes, for the "add bus" route picker
     ]);
 
     debugPrint("API calls completed");
@@ -119,6 +126,7 @@ Future<int> _getDriverId() async {
       _buses = results[1] as List<Map<String, dynamic>>;
       _routes = results[2] as List<Map<String, dynamic>>;
       _passengers = results[3] as List<Map<String, dynamic>>;
+      _allRoutes = results[4] as List<Map<String, dynamic>>;
 
       _loadingPayments = false;
       _loading = false;
@@ -151,11 +159,22 @@ Future<int> _getDriverId() async {
 
   Future<void> _addBus() async {
     if (_busNumCtrl.text.trim().isEmpty) { _snack('Bus number required.', error: true); return; }
+    if (_busTransportCtrl.text.trim().isEmpty) { _snack('Transport name required.', error: true); return; }
+    if (_busRouteId == null) { _snack('Please select a route for this bus.', error: true); return; }
     final cap = int.tryParse(_busCapCtrl.text.trim()) ?? 50;
     final driverId = await _getDriverId();
-    final res = await _api.driverAddBus(busNumber: _busNumCtrl.text.trim(), driverId: driverId, capacity: cap);
+    final res = await _api.driverAddBus(
+      busNumber: _busNumCtrl.text.trim(),
+      transportName: _busTransportCtrl.text.trim(),
+      routeId: _busRouteId!,
+      driverId: driverId,
+      capacity: cap,
+    );
     _snack(res['message'] ?? 'Done.', error: res['status'] != 'success');
-    if (res['status'] == 'success') { _busNumCtrl.clear(); _busCapCtrl.clear(); }
+    if (res['status'] == 'success') {
+      _busNumCtrl.clear(); _busTransportCtrl.clear(); _busCapCtrl.clear();
+      setState(() => _busRouteId = null);
+    }
     _loadAll();
   }
 
@@ -287,22 +306,23 @@ Future<int> _getDriverId() async {
   }
 
   Future<void> _addRoute() async {
-    if (_routeBusId == null || _routeSrcCtrl.text.trim().isEmpty ||
+    if (_routeSrcCtrl.text.trim().isEmpty ||
         _routeDstCtrl.text.trim().isEmpty || _routeTimeCtrl.text.trim().isEmpty ||
         _routeFareCtrl.text.trim().isEmpty) {
       _snack('All route fields are required.', error: true); return;
     }
     final fare = double.tryParse(_routeFareCtrl.text.trim()) ?? 0;
     final res  = await _api.driverAddRoute(
-      busId: _routeBusId!, source: _routeSrcCtrl.text.trim(),
+      source: _routeSrcCtrl.text.trim(),
       destination: _routeDstCtrl.text.trim(), departureTime: _routeTimeCtrl.text.trim(),
       arrivalTime: _routeArrCtrl.text.trim().isEmpty ? null : _routeArrCtrl.text.trim(),
       daysOfWeek: _routeDays, fare: fare,
     );
-    _snack(res['message'] ?? 'Done.', error: res['status'] != 'success');
+    _snack(res['message'] ?? 'Route created — add a bus to it below to start taking bookings.',
+        error: res['status'] != 'success');
     if (res['status'] == 'success') {
       for (final c in [_routeSrcCtrl,_routeDstCtrl,_routeTimeCtrl,_routeArrCtrl,_routeFareCtrl]) c.clear();
-      setState(() { _routeBusId = null; _routeDays = 'Daily'; });
+      setState(() { _routeDays = 'Daily'; });
     }
     _loadAll();
   }
@@ -449,8 +469,12 @@ Future<int> _getDriverId() async {
                   backgroundColor: Colors.teal.shade50,
                   child: Icon(Icons.directions_bus, color: Colors.teal.shade700),
                 ),
-                title: Text(b['bus_number'] ?? '', style: const TextStyle(fontWeight: FontWeight.bold)),
-                subtitle: Text('Capacity: ${b['capacity']} seats  •  Status: ${b['status']}'),
+                title: Text('${b['transport_name'] ?? 'Unnamed Transport'}  •  ${b['bus_number'] ?? ''}',
+                    style: const TextStyle(fontWeight: FontWeight.bold)),
+                subtitle: Text(
+                    'Route: ${(() { final r = b['routes']; return (r is Map && r['source'] != null) ? '${r['source']} → ${r['destination']}' : 'No route'; })()}\n'
+                    'Capacity: ${b['capacity']} seats  •  Status: ${b['status']}'),
+                isThreeLine: true,
                 trailing: PopupMenuButton<String>(
                   onSelected: (s) => _updateBusStatus(b, s),
                   itemBuilder: (_) => ['active', 'maintenance', 'retired']
@@ -678,6 +702,7 @@ _loadingPayments
     final src        = p['source']        ?? '';
     final dst        = p['destination']   ?? '';
     final bus        = p['busNumber']     ?? '-';
+    final transport  = (p['transportName'] ?? '').toString();
     final seat       = p['seatNumber']    ?? '-';
     final bkStatus   = p['bookingStatus'] ?? '-';
     final depDate = p['departureDate']?.toString() ?? '-';
@@ -731,7 +756,8 @@ _loadingPayments
                 const SizedBox(width: 12),
                 Icon(Icons.directions_bus, size: 11, color: Colors.grey.shade600),
                 const SizedBox(width: 4),
-                Text(bus, style: const TextStyle(fontSize: 11, color: Colors.grey)),
+                Text(transport.isNotEmpty && transport != '-' ? '$transport ($bus)' : bus,
+                    style: const TextStyle(fontSize: 11, color: Colors.grey)),
               ]),
             ]),
           ),
@@ -762,11 +788,24 @@ _loadingPayments
           child: Padding(padding: const EdgeInsets.all(16), child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch, children: [
               const Text('Register a New Bus', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
-              const Text('Buses you register are automatically assigned to you.',
+              const Text('Buses you register are automatically assigned to you. Pick the route this bus/transport will serve.',
                   style: TextStyle(color: Colors.grey, fontSize: 11)),
               const SizedBox(height: 12),
               TextField(controller: _busNumCtrl, decoration: const InputDecoration(labelText: 'Bus Number (e.g. BUS-104)')),
+              TextField(controller: _busTransportCtrl, decoration: const InputDecoration(
+                  labelText: 'Transport Name', hintText: 'e.g. Daewoo Express, Faisal Movers')),
               TextField(controller: _busCapCtrl, decoration: const InputDecoration(labelText: 'Capacity (default 50)'), keyboardType: TextInputType.number),
+              DropdownButtonFormField<int>(
+                value: _busRouteId,
+                hint: const Text('Select Route'),
+                isExpanded: true,
+                items: _allRoutes.map((r) => DropdownMenuItem<int>(
+                  value: r['id'] as int,
+                  child: Text('${r['source']} → ${r['destination']}', overflow: TextOverflow.ellipsis),
+                )).toList(),
+                onChanged: (v) => setState(() => _busRouteId = v),
+                decoration: const InputDecoration(labelText: 'Route'),
+              ),
               const SizedBox(height: 14),
               ElevatedButton(
                 style: ElevatedButton.styleFrom(backgroundColor: Colors.teal.shade800, foregroundColor: Colors.white),
@@ -781,18 +820,10 @@ _loadingPayments
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
           child: Padding(padding: const EdgeInsets.all(16), child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-              const Text('Add Route for My Bus', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
-              const Text('You can only add routes for buses assigned to you.',
+              const Text('Create a New Route', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+              const Text('A route can be served by multiple buses. Create it here, then assign a bus to it above.',
                   style: TextStyle(color: Colors.grey, fontSize: 11)),
               const SizedBox(height: 12),
-              DropdownButtonFormField<int>(
-                value: _routeBusId,
-                hint: const Text('Select Your Bus'),
-                items: _buses.map((b) => DropdownMenuItem<int>(
-                    value: b['id'] as int, child: Text(b['bus_number'] ?? ''))).toList(),
-                onChanged: (v) => setState(() => _routeBusId = v),
-                decoration: const InputDecoration(labelText: 'Bus'),
-              ),
               TextField(controller: _routeSrcCtrl,  decoration: const InputDecoration(labelText: 'Source')),
               TextField(controller: _routeDstCtrl,  decoration: const InputDecoration(labelText: 'Destination')),
               TextField(controller: _routeTimeCtrl, decoration: const InputDecoration(labelText: 'Departure Time (HH:MM:SS)')),
@@ -861,7 +892,7 @@ _loadingPayments
 
   @override
   void dispose() {
-    for (final c in [_busNumCtrl,_busCapCtrl,_routeSrcCtrl,_routeDstCtrl,
+    for (final c in [_busNumCtrl,_busTransportCtrl,_busCapCtrl,_routeSrcCtrl,_routeDstCtrl,
                      _routeTimeCtrl,_routeArrCtrl,_routeFareCtrl]) c.dispose();
     super.dispose();
   }

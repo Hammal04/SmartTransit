@@ -185,9 +185,17 @@ Future<List<Map<String, dynamic>>> getAdminDrivers() async {
         .select('''
           id,
           bus_number,
+          transport_name,
           capacity,
           status,
           driver_id,
+          route_id,
+          routes!buses_route_id_fkey(
+            id,
+            source,
+            destination,
+            departure_time
+          ),
           drivers(
             id,
             user_id,
@@ -208,13 +216,31 @@ Future<List<Map<String, dynamic>>> getAdminDrivers() async {
 
   Future<Map<String, dynamic>> adminAddBus({
     required String busNumber,
+    required String transportName,
+    int? routeId,
     int? driverId,
     int capacity = 50,
     String status = 'active',
   }) async {
     try {
+      if (routeId != null) {
+        final dup = await _supabase
+            .from(_buses)
+            .select('id')
+            .eq('route_id', routeId)
+            .eq('bus_number', busNumber)
+            .maybeSingle();
+        if (dup != null) {
+          return {
+            'status': 'error',
+            'message': 'This bus number is already added to this route.',
+          };
+        }
+      }
       final inserted = await _supabase.from(_buses).insert({
         'bus_number': busNumber,
+        'transport_name': transportName,
+        'route_id': routeId,
         'driver_id': driverId,
         'capacity': capacity,
         'status': status,
@@ -228,6 +254,8 @@ Future<List<Map<String, dynamic>>> getAdminDrivers() async {
   Future<Map<String, dynamic>> adminUpdateBus(
     int busId, {
     String? busNumber,
+    String? transportName,
+    int? routeId,
     int? driverId,
     int? capacity,
     String? status,
@@ -235,6 +263,8 @@ Future<List<Map<String, dynamic>>> getAdminDrivers() async {
     try {
       final payload = {
         if (busNumber != null) 'bus_number': busNumber,
+        if (transportName != null) 'transport_name': transportName,
+        if (routeId != null) 'route_id': routeId,
         if (driverId != null) 'driver_id': driverId,
         if (capacity != null) 'capacity': capacity,
         if (status != null) 'status': status,
@@ -259,7 +289,16 @@ Future<List<Map<String, dynamic>>> getAdminDrivers() async {
 
   Future<List<Map<String, dynamic>>> getAdminRoutes() async {
     try {
-      final data = await _supabase.from(_routes).select().order('departure_time');
+      final data = await _supabase.from(_routes).select('''
+        *,
+        buses!buses_route_id_fkey(
+          id,
+          bus_number,
+          transport_name,
+          status,
+          driver_id
+        )
+      ''').order('departure_time');
       return List<Map<String, dynamic>>.from(data);
     } catch (e) {
       debugPrint('[ApiService][getAdminRoutes] ERROR: $e');
@@ -268,7 +307,6 @@ Future<List<Map<String, dynamic>>> getAdminDrivers() async {
   }
 
   Future<Map<String, dynamic>> adminAddRoute({
-    required int busId,
     required String source,
     required String destination,
     required String departureTime,
@@ -278,7 +316,6 @@ Future<List<Map<String, dynamic>>> getAdminDrivers() async {
   }) async {
     try {
       final inserted = await _supabase.from(_routes).insert({
-        'bus_id': busId,
         'source': source,
         'destination': destination,
         'departure_time': departureTime,
@@ -294,7 +331,6 @@ Future<List<Map<String, dynamic>>> getAdminDrivers() async {
 
   Future<Map<String, dynamic>> adminUpdateRoute(
     int routeId, {
-    int? busId,
     String? source,
     String? destination,
     String? departureTime,
@@ -302,7 +338,6 @@ Future<List<Map<String, dynamic>>> getAdminDrivers() async {
   }) async {
     try {
       final payload = {
-        if (busId != null) 'bus_id': busId,
         if (source != null) 'source': source,
         if (destination != null) 'destination': destination,
         if (departureTime != null) 'departure_time': departureTime,
@@ -339,10 +374,11 @@ Future<List<Map<String, dynamic>>> getAdminDrivers() async {
           routes(
             source,
             destination,
-            departure_time,
-            buses(
-              bus_number
-            )
+            departure_time
+          ),
+          buses!bookings_bus_id_fkey(
+            bus_number,
+            transport_name
           ),
           payments(
             amount,
@@ -356,7 +392,7 @@ Future<List<Map<String, dynamic>>> getAdminDrivers() async {
     return rows.map((e) {
       final user = e['users'] ?? {};
       final route = e['routes'] ?? {};
-      final bus = route['buses'] ?? {};
+      final bus = e['buses'] ?? {};
 
       final payment =
           (e['payments'] as List?)?.isNotEmpty == true
@@ -374,6 +410,7 @@ Future<List<Map<String, dynamic>>> getAdminDrivers() async {
         'destination': route['destination'] ?? '-',
         'departureTime': route['departure_time'] ?? '-',
         'busNumber': bus['bus_number'] ?? '-',
+        'transportName': bus['transport_name'] ?? '-',
         'paymentStatus': payment['payment_status'] ?? 'Pending',
         'amount': payment['amount'] ?? 0,
       };
@@ -400,10 +437,11 @@ Future<List<Map<String, dynamic>>> getAdminDrivers() async {
             ),
             routes(
               source,
-              destination,
-              buses(
-                bus_number
-              )
+              destination
+            ),
+            buses!bookings_bus_id_fkey(
+              bus_number,
+              transport_name
             )
           )
         ''')
@@ -414,7 +452,7 @@ Future<List<Map<String, dynamic>>> getAdminDrivers() async {
       final booking = e['bookings'] ?? {};
       final user = booking['users'] ?? {};
       final route = booking['routes'] ?? {};
-      final bus = route['buses'] ?? {};
+      final bus = booking['buses'] ?? {};
 
       return {
         ...e,
@@ -430,6 +468,7 @@ Future<List<Map<String, dynamic>>> getAdminDrivers() async {
         'source': route['source'] ?? '-',
         'destination': route['destination'] ?? '-',
         'bus_number': bus['bus_number'] ?? '-',
+        'transport_name': bus['transport_name'] ?? '-',
       };
     }).toList();
   } catch (e) {
@@ -524,7 +563,20 @@ Future<List<Map<String, dynamic>>> getAdminDrivers() async {
 
   Future<List<Map<String, dynamic>>> getDriverBuses({required int driverId}) async {
     try {
-      final data = await _supabase.from(_buses).select().eq('driver_id', driverId).order('bus_number');
+      final data = await _supabase
+          .from(_buses)
+          .select('''
+            *,
+            routes!buses_route_id_fkey(
+              id,
+              source,
+              destination,
+              departure_time,
+              fare
+            )
+          ''')
+          .eq('driver_id', driverId)
+          .order('bus_number');
       return List<Map<String, dynamic>>.from(data);
     } catch (e) {
       debugPrint('[ApiService][getDriverBuses] ERROR: $e');
@@ -534,12 +586,28 @@ Future<List<Map<String, dynamic>>> getAdminDrivers() async {
 
   Future<Map<String, dynamic>> driverAddBus({
     required String busNumber,
+    required String transportName,
+    required int routeId,
     required int driverId,
     int capacity = 50,
   }) async {
     try {
+      final dup = await _supabase
+          .from(_buses)
+          .select('id')
+          .eq('route_id', routeId)
+          .eq('bus_number', busNumber)
+          .maybeSingle();
+      if (dup != null) {
+        return {
+          'status': 'error',
+          'message': 'This bus number is already added to this route.',
+        };
+      }
       final inserted = await _supabase.from(_buses).insert({
         'bus_number': busNumber,
+        'transport_name': transportName,
+        'route_id': routeId,
         'capacity': capacity,
         'driver_id': driverId,
         'status': 'active',
@@ -569,11 +637,11 @@ Future<List<Map<String, dynamic>>> getAdminDrivers() async {
 
   Future<List<Map<String, dynamic>>> getDriverRoutes({required int driverId}) async {
     try {
-      final buses =
-          List<Map<String, dynamic>>.from(await _supabase.from(_buses).select('id').eq('driver_id', driverId));
-      final busIds = buses.map((b) => b['id']).toList();
-      if (busIds.isEmpty) return [];
-      final data = await _supabase.from(_routes).select().inFilter('bus_id', busIds).order('departure_time');
+      final buses = List<Map<String, dynamic>>.from(
+          await _supabase.from(_buses).select('route_id').eq('driver_id', driverId));
+      final routeIds = buses.map((b) => b['route_id']).whereType<Object>().toSet().toList();
+      if (routeIds.isEmpty) return [];
+      final data = await _supabase.from(_routes).select().inFilter('id', routeIds).order('departure_time');
       return List<Map<String, dynamic>>.from(data);
     } catch (e) {
       debugPrint('[ApiService][getDriverRoutes] ERROR: $e');
@@ -581,8 +649,11 @@ Future<List<Map<String, dynamic>>> getAdminDrivers() async {
     }
   }
 
+  // Lets a driver create a brand-new route (source/destination/time/fare)
+  // that they (or other buses later) can be assigned to. Routes are no
+  // longer tied to a single bus at creation time — use driverAddBus() /
+  // adminAddBus() with a routeId to actually put a bus on this route.
   Future<Map<String, dynamic>> driverAddRoute({
-    required int busId,
     required String source,
     required String destination,
     required String departureTime,
@@ -592,7 +663,6 @@ Future<List<Map<String, dynamic>>> getAdminDrivers() async {
   }) async {
     try {
       final inserted = await _supabase.from(_routes).insert({
-        'bus_id': busId,
         'source': source,
         'destination': destination,
         'departure_time': departureTime,
@@ -613,11 +683,6 @@ Future<List<Map<String, dynamic>>> getAdminDrivers() async {
       final busIds = buses.map((b) => b['id']).toList();
       if (busIds.isEmpty) return [];
 
-      final routes =
-          List<Map<String, dynamic>>.from(await _supabase.from(_routes).select('id').inFilter('bus_id', busIds));
-      final routeIds = routes.map((r) => r['id']).toList();
-      if (routeIds.isEmpty) return [];
-
       final data = await _supabase
           .from(_bookings)
           .select('''
@@ -629,15 +694,18 @@ users!bookings_passenger_id_fkey(
 routes(
     source,
     destination,
-    departure_time,
-    buses(bus_number)
+    departure_time
+),
+buses!bookings_bus_id_fkey(
+    bus_number,
+    transport_name
 ),
 payments(
     amount,
     payment_status
 )
 ''')
-          .inFilter('route_id', routeIds)
+          .inFilter('bus_id', busIds)
           .neq('booking_status', 'cancelled')
           .order('departure_date', ascending: false);
       final rows = List<Map<String, dynamic>>.from(data);
@@ -645,7 +713,7 @@ payments(
 return rows.map((e) {
   final user = e['users'] ?? {};
   final route = e['routes'] ?? {};
-  final bus = route['buses'] ?? {};
+  final bus = e['buses'] ?? {};
   final payment = Map<String, dynamic>.from(e['payments'] ?? {});
 
   return {
@@ -660,6 +728,7 @@ return rows.map((e) {
     'destination': route['destination'] ?? '-',
     'departureTime': route['departure_time'] ?? '-',
     'busNumber': bus['bus_number'] ?? '-',
+    'transportName': bus['transport_name'] ?? '-',
     'paymentStatus': payment['payment_status'] ?? 'Pending',
     'amount': payment['amount'] ?? 0,
   };
@@ -681,14 +750,65 @@ return rows.map((e) {
     try {
       final data = await _supabase.from(_routes).select('''
 *,
-buses(
-  bus_number,
-  capacity
+buses!buses_route_id_fkey(
+  id,
+  status
 )
 ''').order('departure_time');
-      return List<Map<String, dynamic>>.from(data);
+      final rows = List<Map<String, dynamic>>.from(data);
+      // Surface a bus count so the Passenger UI can show "3 transports
+      // available" without a second round trip. A route can now be served
+      // by several buses, so this is no longer a single bus_number.
+      return rows.map((r) {
+        final busesRaw = r['buses'];
+        final busList = busesRaw is List ? List<Map<String, dynamic>>.from(busesRaw) : const <Map<String, dynamic>>[];
+        final activeCount = busList.where((b) => (b['status'] ?? 'active') == 'active').length;
+        return {
+          ...r,
+          'busCount': activeCount,
+        };
+      }).toList();
     } catch (e) {
       debugPrint('[ApiService][getPassengerRoutes] ERROR: $e');
+      return [];
+    }
+  }
+
+  // All active buses/transports serving a specific route — shown to the
+  // passenger after they pick a route, so they can choose which specific
+  // transport (e.g. "Daewoo Express" vs "Faisal Movers") to book.
+  Future<List<Map<String, dynamic>>> getRouteBuses(int routeId) async {
+    try {
+      final data = await _supabase
+          .from(_buses)
+          .select('''
+            id,
+            bus_number,
+            transport_name,
+            capacity,
+            status,
+            driver_id,
+            drivers(
+              id,
+              user_id,
+              users(name)
+            )
+          ''')
+          .eq('route_id', routeId)
+          .eq('status', 'active')
+          .order('bus_number');
+      final rows = List<Map<String, dynamic>>.from(data);
+      return rows.map((b) {
+        final driver = b['drivers'];
+        final driverUser = (driver is Map) ? driver['users'] : null;
+        final driverName = (driverUser is Map) ? (driverUser['name']?.toString() ?? '') : '';
+        return {
+          ...b,
+          'driverName': driverName.isNotEmpty ? driverName : 'Not assigned',
+        };
+      }).toList();
+    } catch (e) {
+      debugPrint('[ApiService][getRouteBuses] ERROR: $e');
       return [];
     }
   }
@@ -718,9 +838,9 @@ Future<Uint8List> generateTicketPdf({
           routes(
             source,
             destination,
-            departure_time,
-            buses(bus_number, driver_id)
+            departure_time
           ),
+          buses!bookings_bus_id_fkey(bus_number, transport_name, driver_id),
           payments(amount, payment_status, transaction_id)
         ''')
         .eq('id', bookingId)
@@ -732,7 +852,7 @@ Future<Uint8List> generateTicketPdf({
 
     final user = (row['users'] is Map) ? row['users'] as Map : const {};
     final route = (row['routes'] is Map) ? row['routes'] as Map : const {};
-    final bus = (route['buses'] is Map) ? route['buses'] as Map : const {};
+    final bus = (row['buses'] is Map) ? row['buses'] as Map : const {};
 
     if (driverId != null && (bus['driver_id'] as num?)?.toInt() != driverId) {
       throw Exception('You are not authorized to view this ticket.');
@@ -757,6 +877,7 @@ Future<Uint8List> generateTicketPdf({
       passengerPhone: (bookingPhone != null && bookingPhone.isNotEmpty) ? bookingPhone : '',
       source: route['source']?.toString() ?? '-',
       destination: route['destination']?.toString() ?? '-',
+      transportName: bus['transport_name']?.toString() ?? '-',
       busNumber: bus['bus_number']?.toString() ?? '-',
       seatNumber: row['seat_number']?.toString() ?? '-',
       departureDate: row['departure_date']?.toString() ?? '-',
@@ -781,6 +902,7 @@ Future<Uint8List> _buildSingleTicketPdfBytes({
   required String passengerPhone,
   required String source,
   required String destination,
+  required String transportName,
   required String busNumber,
   required String seatNumber,
   required String departureDate,
@@ -807,6 +929,7 @@ Future<Uint8List> _buildSingleTicketPdfBytes({
           _pdfInfoRow('Booking ID', '#$bookingId'),
           _pdfInfoRow('Passenger', passengerName),
           if (passengerPhone.isNotEmpty) _pdfInfoRow('Phone', passengerPhone),
+          _pdfInfoRow('Transport', transportName),
           _pdfInfoRow('Bus', busNumber),
           _pdfInfoRow('Seat Number', seatNumber),
           _pdfInfoRow('Departure Date', departureDate),
@@ -847,9 +970,11 @@ Future<Uint8List> _buildSingleTicketPdfBytes({
           .select('''
             id,
             bus_number,
+            transport_name,
             capacity,
             status,
             driver_id,
+            route_id,
             drivers(
               id,
               user_id,
@@ -883,44 +1008,45 @@ Future<Uint8List> _buildSingleTicketPdfBytes({
         return '';
       })();
 
-      // 2. Route(s) served by this bus (normally one, but handled generically).
-      final routesData = await _supabase
-          .from(_routes)
-          .select('id, source, destination, departure_time, arrival_time')
-          .eq('bus_id', busId);
-      final routeList = List<Map<String, dynamic>>.from(routesData);
-      final routeIds = routeList.map((r) => r['id']).toList();
-      final primaryRoute = routeList.isNotEmpty ? routeList.first : <String, dynamic>{};
-
-      // 3. Bookings for this bus's route(s), scoped tightly to the selected date.
-      List<Map<String, dynamic>> bookings = [];
-      if (routeIds.isNotEmpty) {
-        final data = await _supabase
-            .from(_bookings)
-            .select('''
-              id,
-              seat_number,
-              booking_status,
-              departure_date,
-              passenger_name,
-              passenger_phone,
-              users!bookings_passenger_id_fkey(
-                name,
-                email
-              ),
-              payments(
-                amount,
-                payment_status,
-                payment_method,
-                transaction_id
-              )
-            ''')
-            .inFilter('route_id', routeIds)
-            .eq('departure_date', travelDate)
-            .neq('booking_status', 'cancelled')
-            .order('seat_number');
-        bookings = List<Map<String, dynamic>>.from(data);
+      // 2. The single route this specific bus/transport is assigned to.
+      Map<String, dynamic> primaryRoute = const {};
+      final routeId = bus['route_id'];
+      if (routeId != null) {
+        final routeRow = await _supabase
+            .from(_routes)
+            .select('id, source, destination, departure_time, arrival_time')
+            .eq('id', routeId)
+            .maybeSingle();
+        if (routeRow != null) primaryRoute = routeRow;
       }
+
+      // 3. Bookings for THIS specific bus only (not the whole route — a
+      //    route can now have several buses), scoped to the selected date.
+      final data = await _supabase
+          .from(_bookings)
+          .select('''
+            id,
+            seat_number,
+            booking_status,
+            departure_date,
+            passenger_name,
+            passenger_phone,
+            users!bookings_passenger_id_fkey(
+              name,
+              email
+            ),
+            payments(
+              amount,
+              payment_status,
+              payment_method,
+              transaction_id
+            )
+          ''')
+          .eq('bus_id', busId)
+          .eq('departure_date', travelDate)
+          .neq('booking_status', 'cancelled')
+          .order('seat_number');
+      final bookings = List<Map<String, dynamic>>.from(data);
 
       final passengerRows = bookings.map((b) {
         final user = (b['users'] is Map) ? b['users'] as Map : const {};
@@ -961,6 +1087,7 @@ Future<Uint8List> _buildSingleTicketPdfBytes({
 
       return _buildBusPassengerListPdfBytes(
         busNumber: bus['bus_number']?.toString() ?? '-',
+        transportName: bus['transport_name']?.toString() ?? '-',
         source: primaryRoute['source']?.toString() ?? '-',
         destination: primaryRoute['destination']?.toString() ?? '-',
         departureTime: primaryRoute['departure_time']?.toString() ?? '-',
@@ -980,6 +1107,7 @@ Future<Uint8List> _buildSingleTicketPdfBytes({
 
   Future<Uint8List> _buildBusPassengerListPdfBytes({
     required String busNumber,
+    required String transportName,
     required String source,
     required String destination,
     required String departureTime,
@@ -1025,6 +1153,7 @@ Future<Uint8List> _buildSingleTicketPdfBytes({
               borderRadius: pw.BorderRadius.circular(6),
             ),
             child: pw.Column(crossAxisAlignment: pw.CrossAxisAlignment.start, children: [
+              _pdfInfoRow('Transport', transportName),
               _pdfInfoRow('Bus Number', busNumber),
               _pdfInfoRow('Route', '$source -> $destination'),
               _pdfInfoRow('Travel Date', travelDate),
@@ -1104,30 +1233,31 @@ Future<Uint8List> _buildSingleTicketPdfBytes({
     ]);
   }
 
-  /// Get available seats for a route on a specific date.
-  /// Returns { routeId, date, capacity, booked: [], available: [], totalAvailable }
-  Future<Map<String, dynamic>> getSeatAvailability(int routeId, String date) async {
+  /// Get available seats for a specific BUS/transport on a specific date.
+  /// A route can now be served by multiple buses, so seat availability is
+  /// scoped to the exact bus the passenger picked, not the whole route.
+  /// Returns { busId, date, capacity, booked: [], available: [], totalAvailable }
+  Future<Map<String, dynamic>> getSeatAvailability(int busId, String date) async {
     try {
-      debugPrint('[Seats] Fetching route $routeId for date=$date');
+      debugPrint('[Seats] Fetching bus $busId for date=$date');
 
-      final route = await _supabase
-          .from(_routes)
-          .select('id, bus_id, buses(capacity)')
-          .eq('id', routeId)
+      final bus = await _supabase
+          .from(_buses)
+          .select('id, capacity')
+          .eq('id', busId)
           .maybeSingle();
 
-      if (route == null) {
-        debugPrint('[Seats] Route not found — returning error info instead of silently failing');
-        return {'available': [], 'booked': [], 'totalAvailable': 0, 'capacity': 0, 'error': 'Route not found'};
+      if (bus == null) {
+        debugPrint('[Seats] Bus not found — returning error info instead of silently failing');
+        return {'available': [], 'booked': [], 'totalAvailable': 0, 'capacity': 0, 'error': 'Bus not found'};
       }
 
-      final busData = route['buses'];
-      final capacity = (busData is Map ? (busData['capacity'] as num?)?.toInt() : null) ?? 50;
+      final capacity = (bus['capacity'] as num?)?.toInt() ?? 50;
 
       final bookedRows = await _supabase
           .from(_bookings)
           .select('seat_number')
-          .eq('route_id', routeId)
+          .eq('bus_id', busId)
           .eq('departure_date', date)
           .neq('booking_status', 'cancelled');
 
@@ -1139,7 +1269,7 @@ Future<Uint8List> _buildSingleTicketPdfBytes({
       debugPrint('[Seats] capacity=$capacity booked=${booked.length} available=${available.length}');
 
       return {
-        'routeId': routeId,
+        'busId': busId,
         'date': date,
         'capacity': capacity,
         'booked': booked,
@@ -1164,10 +1294,11 @@ routes(
     departure_time,
     arrival_time,
     days_of_week,
-    fare,
-    buses(
-        bus_number
-    )
+    fare
+),
+buses!bookings_bus_id_fkey(
+    bus_number,
+    transport_name
 ),
 payments(
     amount,
@@ -1183,10 +1314,11 @@ payments(
     }
   }
 
-  /// Book a ticket with a specific departure date.
-  /// Payment is always Cash — paid to the driver on boarding.
+  /// Book a ticket on a specific bus/transport with a specific departure
+  /// date. Payment is always Cash — paid to the driver on boarding.
   Future<Map<String, dynamic>> bookTicket({
     required int routeId,
+    required int busId,
     required int seatNumber,
     required String departureDate, // YYYY-MM-DD
     required int passengerId,
@@ -1197,10 +1329,12 @@ payments(
     String? passengerPhone,
   }) async {
     try {
+      // Seats are unique per BUS + date now (a route can have several
+      // buses, each with their own independent seat map).
       final existing = await _supabase
           .from(_bookings)
           .select('id')
-          .eq('route_id', routeId)
+          .eq('bus_id', busId)
           .eq('departure_date', departureDate)
           .eq('seat_number', seatNumber)
           .neq('booking_status', 'cancelled')
@@ -1215,6 +1349,7 @@ payments(
     .insert({
       'passenger_id': passengerId,
       'route_id': routeId,
+      'bus_id': busId,
       'seat_number': seatNumber,
       'departure_date': departureDate,
       'booking_status': 'confirmed',
@@ -1256,7 +1391,7 @@ return {
   'data': inserted,
 };
     } on PostgrestException catch (e) {
-      // Unique-constraint violation on (route_id, departure_date, seat_number)
+      // Unique-constraint violation on (bus_id, departure_date, seat_number)
       if (e.code == '23505') {
         return {'status': 'error', 'message': 'That seat is already booked for this date.'};
       }
@@ -1423,10 +1558,11 @@ Future<List<Map<String, dynamic>>> getAdminPassengers() async  {
           routes(
             source,
             destination,
-            departure_time,
-            buses(
-              bus_number
-            )
+            departure_time
+          ),
+          buses!bookings_bus_id_fkey(
+            bus_number,
+            transport_name
           ),
           payments(
             amount,
@@ -1450,19 +1586,23 @@ debugPrint(rows.toString());
 return rows.map((e) {
       final user = e['users'] ?? {};
       final route = e['routes'] ?? {};
-      final bus = route['buses'] ?? {};
+      final bus = e['buses'] ?? {};
 
       final payment = Map<String, dynamic>.from(e['payments'] ?? {});
 
       return {
         ...e,
         'departureDate': e['departure_date'],
-        'passengerName': user['name'] ?? 'Unknown',
+        'passengerName': ((e['passenger_name'] as String?)?.trim().isNotEmpty ?? false)
+            ? e['passenger_name']
+            : (user['name'] ?? 'Unknown'),
+        'passengerPhone': (e['passenger_phone'] as String?)?.trim() ?? '',
         'passengerEmail': user['email'] ?? '',
         'source': route['source'] ?? '-',
         'destination': route['destination'] ?? '-',
         'departureTime': route['departure_time'] ?? '-',
         'busNumber': bus['bus_number'] ?? '-',
+        'transportName': bus['transport_name'] ?? '-',
         'paymentStatus': payment['payment_status'] ?? 'Pending',
         'amount': payment['amount'] ?? 0,
       };
@@ -1487,27 +1627,26 @@ return rows.map((e) {
             departure_date,
             passenger_name,
             passenger_phone,
-            routes!inner(
-              id,
-              bus_id,
-              buses!inner(driver_id)
-            ),
+            buses!inner(bus_number, transport_name, driver_id),
             users(name)
           )
         ''')
         .eq('payment_status', 'pending')
-        .eq('bookings.routes.buses.driver_id', driverId)
+        .eq('bookings.buses.driver_id', driverId)
         .order('payment_date', ascending: false);
 
     return List<Map<String, dynamic>>.from(data).map((e) {
       final booking = e['bookings'] ?? {};
       final user = booking['users'] ?? {};
+      final bus = booking['buses'] ?? {};
       return {
         ...e,
         'passengerName': ((booking['passenger_name'] as String?)?.trim().isNotEmpty ?? false)
             ? booking['passenger_name']
             : (user['name'] ?? 'Passenger'),
         'passengerPhone': (booking['passenger_phone'] as String?)?.trim() ?? '',
+        'busNumber': bus['bus_number'] ?? '-',
+        'transportName': bus['transport_name'] ?? '-',
       };
     }).toList();
   } catch (e) {
