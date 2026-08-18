@@ -1,0 +1,50 @@
+name: smart_transit_mobile
+description: A Smart Transit Management Mobile Client using Flutter
+
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # State Management
+  provider: ^6.1.1
+
+  # Network & API Integration
+  http: ^1.2.0
+
+  # PDF Generation / Printing
+  printing: ^5.13.0
+
+  # Secure Local Storage (for JWT tokens)
+  flutter_secure_storage: ^9.0.0
+
+  # QR Code Generation (for Ticketing validation)
+  qr_flutter: ^4.1.0
+
+  # Live Tracking Map
+  google_maps_flutter: ^2.5.3
+
+  # Supabase
+  supabase_flutter: ^2.16.0
+
+  # Icons
+  cupertino_icons: ^1.0.6
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
+
+  # Add assets here when needed:
+  # assets:
+  #   - assets/images/
