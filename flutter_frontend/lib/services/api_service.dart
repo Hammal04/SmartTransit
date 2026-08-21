@@ -312,8 +312,41 @@ Future<List<Map<String, dynamic>>> getAdminDrivers() async {
 
   Future<Map<String, dynamic>> adminDeleteBus(int busId) async {
     try {
+      // A bus with existing bookings (any passenger has ever booked a seat
+      // on it, past or future) can't be hard-deleted — bookings.bus_id
+      // references it. Deleting historical booking/ticket/payment records
+      // just to remove a bus would be destructive, so instead: block the
+      // delete with a clear message and point the admin at deactivating
+      // the bus (status = 'inactive') instead, which already hides it from
+      // passengers without losing any booking history.
+      final existingBooking = await _supabase
+          .from(_bookings)
+          .select('id')
+          .eq('bus_id', busId)
+          .limit(1)
+          .maybeSingle();
+      if (existingBooking != null) {
+        return {
+          'status': 'error',
+          'message':
+              "This bus has existing bookings and can't be deleted. Set its status to Inactive instead to hide it from passengers.",
+        };
+      }
+
       await _supabase.from(_buses).delete().eq('id', busId);
       return {'status': 'success'};
+    } on PostgrestException catch (e) {
+      // Belt-and-braces: if a booking sneaks in between the check above
+      // and the delete (race condition), surface a friendly message
+      // instead of the raw foreign-key-violation error.
+      if (e.code == '23503') {
+        return {
+          'status': 'error',
+          'message':
+              "This bus has existing bookings and can't be deleted. Set its status to Inactive instead to hide it from passengers.",
+        };
+      }
+      return {'status': 'error', 'message': e.message};
     } catch (e) {
       return {'status': 'error', 'message': e.toString()};
     }
@@ -382,8 +415,33 @@ Future<List<Map<String, dynamic>>> getAdminDrivers() async {
 
   Future<Map<String, dynamic>> adminDeleteRoute(int routeId) async {
     try {
+      // Same reasoning as adminDeleteBus(): a route with existing bookings
+      // (via bookings.route_id) can't be hard-deleted without losing
+      // booking history. Buses assigned to this route are safe (they're
+      // auto-detached via ON DELETE SET NULL), but bookings are not.
+      final existingBooking = await _supabase
+          .from(_bookings)
+          .select('id')
+          .eq('route_id', routeId)
+          .limit(1)
+          .maybeSingle();
+      if (existingBooking != null) {
+        return {
+          'status': 'error',
+          'message': "This route has existing bookings and can't be deleted.",
+        };
+      }
+
       await _supabase.from(_routes).delete().eq('id', routeId);
       return {'status': 'success'};
+    } on PostgrestException catch (e) {
+      if (e.code == '23503') {
+        return {
+          'status': 'error',
+          'message': "This route has existing bookings and can't be deleted.",
+        };
+      }
+      return {'status': 'error', 'message': e.message};
     } catch (e) {
       return {'status': 'error', 'message': e.toString()};
     }

@@ -31,7 +31,7 @@ class _TrackBusScreenState extends State<TrackBusScreen> {
   Map<String, dynamic>? _location;
   bool _loading = true;
   bool _notAuthorized = false;
-  bool _firstFix = true;
+  String? _loadError;
 
   @override
   void initState() {
@@ -40,31 +40,43 @@ class _TrackBusScreenState extends State<TrackBusScreen> {
   }
 
   Future<void> _init() async {
-    final info = await _api.getPassengerTrackableBus(
-      bookingId: widget.bookingId,
-      passengerId: widget.passengerId,
-    );
-    if (!mounted) return;
-    if (info == null) {
-      setState(() { _loading = false; _notAuthorized = true; });
-      return;
-    }
-    setState(() { _busInfo = info; _loading = false; });
-
-    _locationSub = _api.streamBusLocation(info['busId'] as int).listen((loc) {
+    try {
+      final info = await _api.getPassengerTrackableBus(
+        bookingId: widget.bookingId,
+        passengerId: widget.passengerId,
+      );
       if (!mounted) return;
-      setState(() => _location = loc);
-      if (loc != null) {
-        final lat = (loc['latitude'] as num).toDouble();
-        final lng = (loc['longitude'] as num).toDouble();
-        if (_firstFix) {
-          _firstFix = false;
-          _mapController.move(LatLng(lat, lng), 15);
-        } else {
-          _mapController.move(LatLng(lat, lng), _mapController.camera.zoom);
-        }
+      if (info == null) {
+        setState(() { _loading = false; _notAuthorized = true; });
+        return;
       }
-    });
+      setState(() { _busInfo = info; _loading = false; });
+
+      _locationSub = _api.streamBusLocation(info['busId'] as int).listen((loc) {
+        if (!mounted) return;
+        // On the very first location fix, FlutterMap hasn't been built yet
+        // (it only appears once _location is non-null), so MapController
+        // isn't attached — calling .move() here throws and can blank the
+        // whole page on web. Let MapOptions.initialCenter handle placing the
+        // map correctly on its first build instead; only .move() on later
+        // updates, once the map definitely already exists.
+        final hadFixBefore = _location != null;
+        setState(() => _location = loc);
+        if (loc != null && hadFixBefore) {
+          final lat = (loc['latitude'] as num).toDouble();
+          final lng = (loc['longitude'] as num).toDouble();
+          try {
+            _mapController.move(LatLng(lat, lng), _mapController.camera.zoom);
+          } catch (_) {
+            // Defensive: never let a camera-move failure crash the screen.
+          }
+        }
+      }, onError: (e) {
+        if (mounted) setState(() => _loadError = e.toString());
+      });
+    } catch (e) {
+      if (mounted) setState(() { _loading = false; _loadError = e.toString(); });
+    }
   }
 
   @override
@@ -103,7 +115,23 @@ class _TrackBusScreenState extends State<TrackBusScreen> {
                     ),
                   ),
                 )
-              : Column(children: [
+              : _busInfo == null
+                  ? Center(
+                      child: Padding(
+                        padding: const EdgeInsets.all(24),
+                        child: Column(mainAxisSize: MainAxisSize.min, children: [
+                          Icon(Icons.error_outline, size: 40, color: Colors.red.shade400),
+                          const SizedBox(height: 12),
+                          Text(
+                            _loadError == null
+                                ? 'Could not load tracking info.'
+                                : 'Could not load tracking info:\n$_loadError',
+                            textAlign: TextAlign.center,
+                          ),
+                        ]),
+                      ),
+                    )
+                  : Column(children: [
                   Container(
                     width: double.infinity,
                     padding: const EdgeInsets.all(14),
