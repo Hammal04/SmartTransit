@@ -1,6 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show FilteringTextInputFormatter;
+import 'dart:async';
 import 'package:provider/provider.dart';
 import 'package:printing/printing.dart';
+import 'package:geolocator/geolocator.dart';
 import '../services/auth_provider.dart';
 import '../services/api_service.dart';
 import '../models/models.dart';
@@ -30,6 +33,17 @@ class _DriverDashboardState extends State<DriverDashboard> {
   // being generated. Separate from _generatingTicketIds since these are
   // two independent PDF features (single ticket vs. bus manifest).
   final Set<int> _generatingManifestBusIds = {};
+
+  // ── Live GPS sharing ────────────────────────────────────────────────────
+  // At most one bus can be actively shared at a time per driver session.
+  // busId -> periodic position subscription, so toggling one bus off
+  // doesn't affect another if the driver switches buses.
+  StreamSubscription<Position>? _locationSub;
+  int? _sharingBusId;
+  int? _startingShareBusId;
+
+// PKT = UTC+5.
+DateTime get _pktNow => DateTime.now().toUtc().add(const Duration(hours: 5));
 
 Future<int> _getDriverId() async {
   if (_driverId != null) return _driverId!;
@@ -68,19 +82,20 @@ Future<int> _getDriverId() async {
   final _busTransportCtrl = TextEditingController();
   final _busCapCtrl = TextEditingController();
   int?   _busRouteId;
+  // Timing/fare now live on the bus/transport, not the route.
+  final _busTimeCtrl = TextEditingController();
+  final _busArrCtrl  = TextEditingController();
+  final _busFareCtrl = TextEditingController();
+  String _busDays    = 'Daily';
 
   // All routes in the system (not just this driver's) — used so a driver
   // can add a new bus/transport to any existing route, since a route can
   // now be served by multiple buses/drivers.
   List<Map<String, dynamic>> _allRoutes = [];
 
-  // Add Route form
+  // Add Route form — a route is just the source/destination city pair now.
   final _routeSrcCtrl  = TextEditingController();
   final _routeDstCtrl  = TextEditingController();
-  final _routeTimeCtrl = TextEditingController();
-  final _routeArrCtrl  = TextEditingController();
-  final _routeFareCtrl = TextEditingController();
-  String _routeDays    = 'Daily';
 
   @override
   void initState() {
@@ -161,6 +176,8 @@ Future<int> _getDriverId() async {
     if (_busNumCtrl.text.trim().isEmpty) { _snack('Bus number required.', error: true); return; }
     if (_busTransportCtrl.text.trim().isEmpty) { _snack('Transport name required.', error: true); return; }
     if (_busRouteId == null) { _snack('Please select a route for this bus.', error: true); return; }
+    if (_busTimeCtrl.text.trim().isEmpty) { _snack('Departure time required.', error: true); return; }
+    if (_busFareCtrl.text.trim().isEmpty) { _snack('Fare required.', error: true); return; }
     final cap = int.tryParse(_busCapCtrl.text.trim()) ?? 50;
     final driverId = await _getDriverId();
     final res = await _api.driverAddBus(
@@ -169,11 +186,16 @@ Future<int> _getDriverId() async {
       routeId: _busRouteId!,
       driverId: driverId,
       capacity: cap,
+      departureTime: _busTimeCtrl.text.trim(),
+      arrivalTime: _busArrCtrl.text.trim().isEmpty ? null : _busArrCtrl.text.trim(),
+      fare: double.tryParse(_busFareCtrl.text.trim()) ?? 0,
+      daysOfWeek: _busDays,
     );
     _snack(res['message'] ?? 'Done.', error: res['status'] != 'success');
     if (res['status'] == 'success') {
       _busNumCtrl.clear(); _busTransportCtrl.clear(); _busCapCtrl.clear();
-      setState(() => _busRouteId = null);
+      _busTimeCtrl.clear(); _busArrCtrl.clear(); _busFareCtrl.clear();
+      setState(() { _busRouteId = null; _busDays = 'Daily'; });
     }
     _loadAll();
   }
@@ -183,6 +205,291 @@ Future<int> _getDriverId() async {
     final res = await _api.driverUpdateBusStatus(b['id'] as int, newStatus, driverId: driverId);
     _snack(res['message'] ?? 'Done.', error: res['status'] != 'success');
     _loadAll();
+  }
+
+  // ── Walk-in seat sale ────────────────────────────────────────────────────
+  // Lets a driver mark a seat as booked when a passenger pays cash directly
+  // to them without using the app. Creates a normal booking (so it shows up
+  // everywhere bookings do) with the driver's own account as the recorded
+  // passenger_id, but with the real walk-in passenger's name/phone saved on
+  // the booking, and the payment already marked 'confirmed' since the cash
+  // was collected on the spot.
+  static final RegExp _walkInNameRegex =
+      RegExp(r"^[a-zA-Z\u00C0-\u017F][a-zA-Z\u00C0-\u017F .'-]{1,49}$");
+  static final RegExp _walkInPhoneRegex = RegExp(r'^(\+92|0)3\d{9}$');
+
+  // ── Live GPS sharing ────────────────────────────────────────────────────
+  Future<void> _toggleLocationSharing(Map<String, dynamic> bus) async {
+    final busId = bus['id'] as int;
+
+    // Already sharing this bus -> turn it off.
+    if (_sharingBusId == busId) {
+      await _locationSub?.cancel();
+      _locationSub = null;
+      final driverId = await _getDriverId();
+      await _api.driverStopSharingLocation(busId: busId, driverId: driverId);
+      setState(() => _sharingBusId = null);
+      _snack('Stopped sharing location for ${bus['transport_name'] ?? bus['bus_number']}.');
+      return;
+    }
+
+    // Switching from a different bus -> stop that one first.
+    if (_sharingBusId != null) {
+      await _locationSub?.cancel();
+      _locationSub = null;
+      final driverId = await _getDriverId();
+      await _api.driverStopSharingLocation(busId: _sharingBusId!, driverId: driverId);
+      setState(() => _sharingBusId = null);
+    }
+
+    setState(() => _startingShareBusId = busId);
+    try {
+      var permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission == LocationPermission.denied || permission == LocationPermission.deniedForever) {
+        _snack('Location permission is required to share your position with passengers.', error: true);
+        return;
+      }
+      if (!await Geolocator.isLocationServiceEnabled()) {
+        _snack('Please turn on device location services.', error: true);
+        return;
+      }
+
+      final driverId = await _getDriverId();
+
+      // Push an immediate fix so passengers aren't staring at a blank map,
+      // then keep updating as the driver moves.
+      final first = await Geolocator.getCurrentPosition();
+      await _api.driverUpdateBusLocation(
+        busId: busId, driverId: driverId,
+        latitude: first.latitude, longitude: first.longitude,
+        heading: first.heading, speed: first.speed,
+      );
+
+      _locationSub = Geolocator.getPositionStream(
+        locationSettings: const LocationSettings(accuracy: LocationAccuracy.high, distanceFilter: 20),
+      ).listen((pos) async {
+        await _api.driverUpdateBusLocation(
+          busId: busId, driverId: driverId,
+          latitude: pos.latitude, longitude: pos.longitude,
+          heading: pos.heading, speed: pos.speed,
+        );
+      });
+
+      setState(() => _sharingBusId = busId);
+      _snack('Now sharing live location for ${bus['transport_name'] ?? bus['bus_number']}.');
+    } catch (e) {
+      _snack('Could not start location sharing: $e', error: true);
+    } finally {
+      setState(() => _startingShareBusId = null);
+    }
+  }
+
+  Future<void> _showSellSeatSheet(Map<String, dynamic> bus) async {
+    final busId = bus['id'] as int;
+    final busCapacity = (bus['capacity'] as num?)?.toInt() ?? 50;
+    final route = bus['routes'];
+    final routeId = (route is Map) ? route['id'] as int? : null;
+    if (routeId == null) {
+      _snack('This bus is not assigned to a route yet.', error: true);
+      return;
+    }
+
+    DateTime date = _pktNow;
+    List<int> booked = [];
+    int? selectedSeat;
+    bool loadingSeats = true;
+    bool submitting = false;
+    final nameCtrl = TextEditingController();
+    final phoneCtrl = TextEditingController();
+    String? selectedGender;
+
+    Future<void> loadSeats(StateSetter setModalState) async {
+      setModalState(() => loadingSeats = true);
+      final dateStr = '${date.year}-${date.month.toString().padLeft(2,'0')}-${date.day.toString().padLeft(2,'0')}';
+      final res = await _api.getSeatAvailability(busId, dateStr);
+      booked = List<int>.from(res['booked'] ?? []);
+      setModalState(() { loadingSeats = false; selectedSeat = null; });
+    }
+
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (sheetCtx) => StatefulBuilder(builder: (sheetCtx, setModalState) {
+        if (loadingSeats && booked.isEmpty && selectedSeat == null) {
+          // Kick off the first load once the sheet is actually visible.
+          Future.microtask(() => loadSeats(setModalState));
+        }
+        final dateStr = '${date.day.toString().padLeft(2,'0')}/${date.month.toString().padLeft(2,'0')}/${date.year}';
+        return Padding(
+          padding: EdgeInsets.only(bottom: MediaQuery.of(sheetCtx).viewInsets.bottom),
+          child: DraggableScrollableSheet(
+            initialChildSize: 0.85, maxChildSize: 0.95, minChildSize: 0.5,
+            expand: false,
+            builder: (_, scrollCtrl) => SingleChildScrollView(
+              controller: scrollCtrl,
+              padding: const EdgeInsets.all(20),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                Text('Sell a Seat — ${bus['transport_name'] ?? bus['bus_number']}',
+                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                const Text('For a passenger who paid you cash directly, without using the app.',
+                    style: TextStyle(fontSize: 11, color: Colors.grey)),
+                const SizedBox(height: 14),
+                InkWell(
+                  onTap: () async {
+                    final picked = await showDatePicker(
+                      context: sheetCtx, initialDate: date, firstDate: _pktNow,
+                      lastDate: _pktNow.add(const Duration(days: 90)),
+                    );
+                    if (picked != null) {
+                      date = picked;
+                      await loadSeats(setModalState);
+                    }
+                  },
+                  child: InputDecorator(
+                    decoration: const InputDecoration(labelText: 'Travel Date', prefixIcon: Icon(Icons.calendar_today_outlined)),
+                    child: Text(dateStr),
+                  ),
+                ),
+                const SizedBox(height: 14),
+                const Text('Tap a seat to sell it', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                const SizedBox(height: 8),
+                Row(children: [
+                  _sellSheetLegend(Colors.blue.shade50, Colors.blue.shade700, 'Available'),
+                  const SizedBox(width: 10),
+                  _sellSheetLegend(Colors.amber.shade600, Colors.white, 'Selected'),
+                  const SizedBox(width: 10),
+                  _sellSheetLegend(Colors.grey.shade300, Colors.grey.shade600, 'Booked'),
+                ]),
+                const SizedBox(height: 10),
+                loadingSeats
+                    ? const Center(child: Padding(padding: EdgeInsets.all(20), child: CircularProgressIndicator()))
+                    : Wrap(
+                        alignment: WrapAlignment.center,
+                        spacing: 8, runSpacing: 8,
+                        children: List.generate(busCapacity, (i) {
+                          final seat = i + 1;
+                          final isBooked = booked.contains(seat);
+                          final isSelected = selectedSeat == seat;
+                          Color bg, fg;
+                          if (isSelected) { bg = Colors.amber.shade600; fg = Colors.white; }
+                          else if (isBooked) { bg = Colors.grey.shade300; fg = Colors.grey.shade600; }
+                          else { bg = Colors.blue.shade50; fg = Colors.blue.shade700; }
+                          return GestureDetector(
+                            onTap: isBooked ? null : () => setModalState(() => selectedSeat = isSelected ? null : seat),
+                            child: Container(
+                              width: 36, height: 36,
+                              decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(8)),
+                              child: Stack(alignment: Alignment.center, children: [
+                                Icon(Icons.event_seat, size: 18, color: fg),
+                                Positioned(bottom: 1, child: Text('$seat', style: TextStyle(fontSize: 7, fontWeight: FontWeight.bold, color: fg))),
+                              ]),
+                            ),
+                          );
+                        }),
+                      ),
+                if (selectedSeat != null) ...[
+                  const SizedBox(height: 18),
+                  Text('Seat $selectedSeat — Passenger Details', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: nameCtrl,
+                    textCapitalization: TextCapitalization.words,
+                    decoration: const InputDecoration(labelText: 'Full Name', prefixIcon: Icon(Icons.person_outline), border: OutlineInputBorder()),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: phoneCtrl,
+                    keyboardType: TextInputType.phone,
+                    inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[0-9+\s-]'))],
+                    decoration: const InputDecoration(labelText: 'Phone Number', hintText: 'e.g. 03001234567', prefixIcon: Icon(Icons.phone_outlined), border: OutlineInputBorder()),
+                  ),
+                  const SizedBox(height: 10),
+                  Row(children: [
+                    Expanded(
+                      child: ChoiceChip(
+                        label: const Text('Male'),
+                        avatar: const Icon(Icons.male, size: 16),
+                        selected: selectedGender == 'Male',
+                        onSelected: (_) => setModalState(() => selectedGender = 'Male'),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: ChoiceChip(
+                        label: const Text('Female'),
+                        avatar: const Icon(Icons.female, size: 16),
+                        selected: selectedGender == 'Female',
+                        onSelected: (_) => setModalState(() => selectedGender = 'Female'),
+                      ),
+                    ),
+                  ]),
+                  const SizedBox(height: 16),
+                  ElevatedButton.icon(
+                    icon: submitting
+                        ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                        : const Icon(Icons.check_circle_outline),
+                    label: Text(submitting ? 'Selling…' : 'Confirm Cash Sale'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.teal.shade800, foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                    ),
+                    onPressed: submitting ? null : () async {
+                      final name = nameCtrl.text.trim();
+                      final phone = phoneCtrl.text.trim();
+                      if (!_walkInNameRegex.hasMatch(name)) {
+                        _snack('Enter a valid passenger name.', error: true); return;
+                      }
+                      if (!_walkInPhoneRegex.hasMatch(phone.replaceAll(RegExp(r'[\s-]'), ''))) {
+                        _snack('Enter a valid phone number (e.g. 03001234567).', error: true); return;
+                      }
+                      if (selectedGender == null) {
+                        _snack('Select the passenger\'s gender.', error: true); return;
+                      }
+                      setModalState(() => submitting = true);
+                      final dateStr2 = '${date.year}-${date.month.toString().padLeft(2,'0')}-${date.day.toString().padLeft(2,'0')}';
+                      final res = await _api.bookTicket(
+                        routeId: routeId,
+                        busId: busId,
+                        seatNumber: selectedSeat!,
+                        departureDate: dateStr2,
+                        passengerId: context.read<AuthProvider>().currentUser!.id,
+                        passengerName: name,
+                        passengerPhone: phone,
+                        passengerGender: selectedGender,
+                        paymentStatus: 'confirmed', // cash already collected in person
+                        bookingStatus: 'confirmed', // driver is booking it in person — seat is booked immediately, no separate confirmation step
+                      );
+                      if (res['status'] == 'success') {
+                        if (mounted) Navigator.pop(sheetCtx);
+                        _snack('Seat $selectedSeat sold and marked booked.');
+                        _loadAll();
+                      } else {
+                        setModalState(() => submitting = false);
+                        _snack(res['message'] ?? 'Could not sell this seat.', error: true);
+                      }
+                    },
+                  ),
+                ],
+                const SizedBox(height: 12),
+              ]),
+            ),
+          ),
+        );
+      }),
+    );
+  }
+
+  Widget _sellSheetLegend(Color bg, Color fg, String label) {
+    return Row(mainAxisSize: MainAxisSize.min, children: [
+      Container(width: 14, height: 14, decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(4)),
+          child: Icon(Icons.event_seat, size: 9, color: fg)),
+      const SizedBox(width: 4),
+      Text(label, style: const TextStyle(fontSize: 10, color: Colors.grey)),
+    ]);
   }
 
   // ── Ticket download ──────────────────────────────────────────────────────
@@ -306,23 +613,17 @@ Future<int> _getDriverId() async {
   }
 
   Future<void> _addRoute() async {
-    if (_routeSrcCtrl.text.trim().isEmpty ||
-        _routeDstCtrl.text.trim().isEmpty || _routeTimeCtrl.text.trim().isEmpty ||
-        _routeFareCtrl.text.trim().isEmpty) {
-      _snack('All route fields are required.', error: true); return;
+    if (_routeSrcCtrl.text.trim().isEmpty || _routeDstCtrl.text.trim().isEmpty) {
+      _snack('Source and destination are required.', error: true); return;
     }
-    final fare = double.tryParse(_routeFareCtrl.text.trim()) ?? 0;
     final res  = await _api.driverAddRoute(
       source: _routeSrcCtrl.text.trim(),
-      destination: _routeDstCtrl.text.trim(), departureTime: _routeTimeCtrl.text.trim(),
-      arrivalTime: _routeArrCtrl.text.trim().isEmpty ? null : _routeArrCtrl.text.trim(),
-      daysOfWeek: _routeDays, fare: fare,
+      destination: _routeDstCtrl.text.trim(),
     );
-    _snack(res['message'] ?? 'Route created — add a bus to it below to start taking bookings.',
+    _snack(res['message'] ?? 'Route created — add a bus to it below (with its own timing and fare) to start taking bookings.',
         error: res['status'] != 'success');
     if (res['status'] == 'success') {
-      for (final c in [_routeSrcCtrl,_routeDstCtrl,_routeTimeCtrl,_routeArrCtrl,_routeFareCtrl]) c.clear();
-      setState(() { _routeDays = 'Daily'; });
+      for (final c in [_routeSrcCtrl,_routeDstCtrl]) c.clear();
     }
     _loadAll();
   }
@@ -473,7 +774,8 @@ Future<int> _getDriverId() async {
                     style: const TextStyle(fontWeight: FontWeight.bold)),
                 subtitle: Text(
                     'Route: ${(() { final r = b['routes']; return (r is Map && r['source'] != null) ? '${r['source']} → ${r['destination']}' : 'No route'; })()}\n'
-                    'Capacity: ${b['capacity']} seats  •  Status: ${b['status']}'),
+                    'Dep: ${b['departure_time'] ?? '-'}${(b['arrival_time'] ?? '').toString().isNotEmpty ? "  •  Arr: ${b['arrival_time']}" : ""}  •  PKR ${_toDouble(b['fare']).toStringAsFixed(0)}\n'
+                    'Capacity: ${b['capacity']} seats  •  Status: ${b['status']} • ${b['days_of_week'] ?? 'Daily'}'),
                 isThreeLine: true,
                 trailing: PopupMenuButton<String>(
                   onSelected: (s) => _updateBusStatus(b, s),
@@ -483,6 +785,48 @@ Future<int> _getDriverId() async {
                   child: Chip(
                     label: Text(b['status'] ?? '', style: const TextStyle(fontSize: 11)),
                     backgroundColor: b['status'] == 'active' ? Colors.green.shade50 : Colors.orange.shade50,
+                  ),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                child: SizedBox(
+                  width: double.infinity,
+                  child: Builder(builder: (_) {
+                    final busId = b['id'] as int;
+                    final isThisSharing = _sharingBusId == busId;
+                    final isThisStarting = _startingShareBusId == busId;
+                    final isBusy = _startingShareBusId != null;
+                    return OutlinedButton.icon(
+                      onPressed: isBusy ? null : () => _toggleLocationSharing(b),
+                      icon: isThisStarting
+                          ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
+                          : Icon(isThisSharing ? Icons.gps_off : Icons.gps_fixed, size: 16,
+                              color: isThisSharing ? Colors.red.shade700 : Colors.teal.shade800),
+                      label: Text(isThisStarting
+                          ? 'Starting…'
+                          : isThisSharing
+                              ? 'Stop Sharing Location'
+                              : 'Share Live Location'),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: isThisSharing ? Colors.red.shade700 : Colors.teal.shade800,
+                        side: BorderSide(color: isThisSharing ? Colors.red.shade300 : Colors.teal.shade300),
+                      ),
+                    );
+                  }),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                child: SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton.icon(
+                    onPressed: () => _showSellSeatSheet(b),
+                    icon: const Icon(Icons.event_seat, size: 16),
+                    label: const Text('Sell Seat (Walk-in / Cash)'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.teal.shade700, foregroundColor: Colors.white,
+                    ),
                   ),
                 ),
               ),
@@ -512,10 +856,16 @@ Future<int> _getDriverId() async {
         if (_routes.isEmpty)
           const Center(child: Padding(padding: EdgeInsets.all(24), child: Text('No routes yet.'))),
         ..._routes.map((r) {
-          final arr  = r['arrival_time']?.toString() ?? '';
-          final dep  = r['departure_time']?.toString() ?? '-';
-          final days = r['days_of_week']?.toString() ?? 'Daily';
-          final fare = _toDouble(r['fare']);
+          final routeId = r['id'];
+          final myBuses = _buses.where((b) => b['route_id'] == routeId).toList();
+          final busSummary = myBuses.isEmpty
+              ? 'No buses of mine assigned yet'
+              : myBuses.map((b) {
+                  final name = b['transport_name'] ?? b['bus_number'] ?? '-';
+                  final dep = (b['departure_time'] ?? '').toString();
+                  final fare = _toDouble(b['fare']);
+                  return '$name (${dep.isNotEmpty ? "$dep, " : ""}PKR ${fare.toStringAsFixed(0)})';
+                }).join(', ');
           return Card(
             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
             child: ListTile(
@@ -525,9 +875,7 @@ Future<int> _getDriverId() async {
               ),
               title: Text('${r["source"]} → ${r["destination"]}',
                   style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-              subtitle: Text(
-                '$days\nDep: $dep${arr.isNotEmpty ? "  •  Arr: $arr" : ""}  •  PKR ${fare.toStringAsFixed(0)}',
-              ),
+              subtitle: Text('My buses: $busSummary'),
               isThreeLine: true,
             ),
           );
@@ -561,6 +909,7 @@ _loadingPayments
           )
         : Column(
             children: _pendingPayments.map((payment) {
+              final bookingId = payment['bookingId'] as int?;
               return Card(
                 margin: const EdgeInsets.only(bottom: 10),
                 child: ListTile(
@@ -575,28 +924,49 @@ _loadingPayments
                     '${(payment['passengerPhone']?.toString().isNotEmpty ?? false) ? '\n${payment['passengerPhone']}' : ''}'
                     '\nAmount: PKR ${payment['amount']}',
                   ),
-                  trailing: ElevatedButton(
-                    onPressed: () async {
-                      final ok = await _api.confirmCashPayment(
-                        paymentId: payment['id'],
-                      );
-
-                      if (ok) {
-                        if (!mounted) return;
-
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(
-                            content: Text(
-                              'Payment confirmed successfully',
-                            ),
+                  isThreeLine: true,
+                  trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                    IconButton(
+                      tooltip: 'Reject booking (releases the seat)',
+                      icon: const Icon(Icons.close, color: Colors.red),
+                      onPressed: bookingId == null ? null : () async {
+                        final confirmReject = await showDialog<bool>(
+                          context: context,
+                          builder: (_) => AlertDialog(
+                            title: const Text('Reject Booking?'),
+                            content: const Text('This releases the seat back to available and cancels the passenger\'s booking.'),
+                            actions: [
+                              TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+                              TextButton(onPressed: () => Navigator.pop(context, true),
+                                  child: const Text('Reject', style: TextStyle(color: Colors.red))),
+                            ],
                           ),
                         );
-
+                        if (confirmReject != true) return;
+                        final driverId = await _getDriverId();
+                        final res = await _api.driverRejectBooking(bookingId: bookingId, driverId: driverId);
+                        if (!mounted) return;
+                        _snack(res['message'] ?? 'Booking rejected — seat released.', error: res['status'] != 'success');
                         await _loadAll();
-                      }
-                    },
-                    child: const Text('Confirm'),
-                  ),
+                      },
+                    ),
+                    ElevatedButton(
+                      onPressed: bookingId == null ? null : () async {
+                        final driverId = await _getDriverId();
+                        final res = await _api.driverConfirmBooking(bookingId: bookingId, driverId: driverId);
+                        if (!mounted) return;
+                        if (res['status'] == 'success') {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(content: Text('Booking confirmed — seat is now booked.')),
+                          );
+                          await _loadAll();
+                        } else {
+                          _snack(res['message'] ?? 'Could not confirm this booking.', error: true);
+                        }
+                      },
+                      child: const Text('Confirm'),
+                    ),
+                  ]),
                 ),
               );
             }).toList(),
@@ -705,6 +1075,7 @@ _loadingPayments
     final transport  = (p['transportName'] ?? '').toString();
     final seat       = p['seatNumber']    ?? '-';
     final bkStatus   = p['bookingStatus'] ?? '-';
+    final gender     = (p['passengerGender'] ?? '').toString();
     final depDate = p['departureDate']?.toString() ?? '-';
 
     return Card(
@@ -725,8 +1096,14 @@ _loadingPayments
             ),
             const SizedBox(width: 10),
             Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text(p['passengerName'] ?? 'Unknown',
-                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+              Row(children: [
+                Flexible(child: Text(p['passengerName'] ?? 'Unknown',
+                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13), overflow: TextOverflow.ellipsis)),
+                if (gender.isNotEmpty) ...[
+                  const SizedBox(width: 6),
+                  _genderBadge(gender),
+                ],
+              ]),
               if (p['passengerEmail'] != null && p['passengerEmail'].toString().isNotEmpty)
                 Text(p['passengerEmail'].toString(),
                     style: const TextStyle(fontSize: 10, color: Colors.grey)),
@@ -806,6 +1183,18 @@ _loadingPayments
                 onChanged: (v) => setState(() => _busRouteId = v),
                 decoration: const InputDecoration(labelText: 'Route'),
               ),
+              const SizedBox(height: 6),
+              const Text('This transport\'s own schedule & price', style: TextStyle(fontSize: 11, color: Colors.grey)),
+              TextField(controller: _busTimeCtrl, decoration: const InputDecoration(labelText: 'Departure Time (HH:MM:SS)')),
+              TextField(controller: _busArrCtrl,  decoration: const InputDecoration(labelText: 'Arrival Time (HH:MM:SS) — optional')),
+              DropdownButtonFormField<String>(
+                value: _busDays,
+                decoration: const InputDecoration(labelText: 'Days of Operation'),
+                items: ['Daily','Weekdays','Weekends','Mon,Wed,Fri','Tue,Thu','Mon,Tue,Wed,Thu,Fri','Sat,Sun']
+                    .map((d) => DropdownMenuItem(value: d, child: Text(d))).toList(),
+                onChanged: (v) => setState(() => _busDays = v!),
+              ),
+              TextField(controller: _busFareCtrl, decoration: const InputDecoration(labelText: 'Fare (PKR)'), keyboardType: TextInputType.number),
               const SizedBox(height: 14),
               ElevatedButton(
                 style: ElevatedButton.styleFrom(backgroundColor: Colors.teal.shade800, foregroundColor: Colors.white),
@@ -821,22 +1210,11 @@ _loadingPayments
           child: Padding(padding: const EdgeInsets.all(16), child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch, children: [
               const Text('Create a New Route', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
-              const Text('A route can be served by multiple buses. Create it here, then assign a bus to it above.',
+              const Text('A route is just the source/destination city pair. Create it here, then assign a bus to it above — each bus sets its own timing and fare.',
                   style: TextStyle(color: Colors.grey, fontSize: 11)),
               const SizedBox(height: 12),
               TextField(controller: _routeSrcCtrl,  decoration: const InputDecoration(labelText: 'Source')),
               TextField(controller: _routeDstCtrl,  decoration: const InputDecoration(labelText: 'Destination')),
-              TextField(controller: _routeTimeCtrl, decoration: const InputDecoration(labelText: 'Departure Time (HH:MM:SS)')),
-              TextField(controller: _routeArrCtrl,  decoration: const InputDecoration(labelText: 'Arrival Time (HH:MM:SS) — optional')),
-              const SizedBox(height: 6),
-              DropdownButtonFormField<String>(
-                value: _routeDays,
-                decoration: const InputDecoration(labelText: 'Days of Operation'),
-                items: ['Daily','Weekdays','Weekends','Mon,Wed,Fri','Tue,Thu','Mon,Tue,Wed,Thu,Fri','Sat,Sun']
-                    .map((d) => DropdownMenuItem(value: d, child: Text(d))).toList(),
-                onChanged: (v) => setState(() => _routeDays = v!),
-              ),
-              TextField(controller: _routeFareCtrl, decoration: const InputDecoration(labelText: 'Fare (PKR)'), keyboardType: TextInputType.number),
               const SizedBox(height: 14),
               ElevatedButton(
                 style: ElevatedButton.styleFrom(backgroundColor: Colors.indigo, foregroundColor: Colors.white),
@@ -867,6 +1245,20 @@ _loadingPayments
     );
   }
 
+  Widget _genderBadge(String gender) {
+    final isMale = gender == 'Male';
+    final color = isMale ? Colors.blue : Colors.pink;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(color: color.shade50, borderRadius: BorderRadius.circular(6)),
+      child: Row(mainAxisSize: MainAxisSize.min, children: [
+        Icon(isMale ? Icons.male : Icons.female, size: 10, color: color.shade700),
+        const SizedBox(width: 2),
+        Text(gender, style: TextStyle(fontSize: 9, color: color.shade700, fontWeight: FontWeight.w600)),
+      ]),
+    );
+  }
+
   Widget _pChip(String status) {
     Color bg, fg;
     final s = status.toLowerCase();
@@ -892,8 +1284,9 @@ _loadingPayments
 
   @override
   void dispose() {
-    for (final c in [_busNumCtrl,_busTransportCtrl,_busCapCtrl,_routeSrcCtrl,_routeDstCtrl,
-                     _routeTimeCtrl,_routeArrCtrl,_routeFareCtrl]) c.dispose();
+    _locationSub?.cancel();
+    for (final c in [_busNumCtrl,_busTransportCtrl,_busCapCtrl,_busTimeCtrl,_busArrCtrl,_busFareCtrl,
+                     _routeSrcCtrl,_routeDstCtrl]) c.dispose();
     super.dispose();
   }
 }

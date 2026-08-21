@@ -26,9 +26,9 @@ dependencies:
 
   # QR Code Generation (for Ticketing validation)
   qr_flutter: ^4.1.0
-
-  # Live Tracking Map
-  google_maps_flutter: ^2.5.3
+  flutter_map: ^7.0.2
+  latlong2: ^0.9.1
+  geolocator: ^13.0.1
 
   # Supabase
   supabase_flutter: ^2.16.0

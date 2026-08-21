@@ -52,14 +52,15 @@ class _AdminDashboardState extends State<AdminDashboard> {
   final _busCapCtrl    = TextEditingController();
   int?  _busDrvId;
   int?  _busRouteId;
+  // Timing/fare now live on the bus/transport, not the route.
+  final _busTimeCtrl   = TextEditingController();
+  final _busArrCtrl    = TextEditingController();
+  final _busFareCtrl   = TextEditingController();
+  String _busDays      = 'Daily';
 
-  // Add Route form
+  // Add Route form — a route is now just the source/destination city pair.
   final _routeSrcCtrl  = TextEditingController();
   final _routeDstCtrl  = TextEditingController();
-  final _routeTimeCtrl = TextEditingController();
-  final _routeArrCtrl  = TextEditingController();
-  final _routeFareCtrl = TextEditingController();
-  String _routeDays    = 'Daily';
 
   @override
   void initState() {
@@ -189,16 +190,23 @@ setState(() {
     if (_busNumberCtrl.text.trim().isEmpty) { _snack('Bus number required.', error: true); return; }
     if (_busTransportCtrl.text.trim().isEmpty) { _snack('Transport name required.', error: true); return; }
     if (_busRouteId == null) { _snack('Please select a route for this bus.', error: true); return; }
+    if (_busTimeCtrl.text.trim().isEmpty) { _snack('Departure time required.', error: true); return; }
+    if (_busFareCtrl.text.trim().isEmpty) { _snack('Fare required.', error: true); return; }
     final res = await _api.adminAddBus(
         busNumber: _busNumberCtrl.text.trim(),
         transportName: _busTransportCtrl.text.trim(),
         routeId: _busRouteId,
         driverId: _busDrvId,
-        capacity: int.tryParse(_busCapCtrl.text.trim()) ?? 50);
+        capacity: int.tryParse(_busCapCtrl.text.trim()) ?? 50,
+        departureTime: _busTimeCtrl.text.trim(),
+        arrivalTime: _busArrCtrl.text.trim().isEmpty ? null : _busArrCtrl.text.trim(),
+        fare: double.tryParse(_busFareCtrl.text.trim()) ?? 0,
+        daysOfWeek: _busDays);
     _snack(res['message'] ?? 'Done.', error: res['status'] != 'success');
     if (res['status'] == 'success') {
       _busNumberCtrl.clear(); _busTransportCtrl.clear(); _busCapCtrl.clear();
-      setState(() { _busDrvId = null; _busRouteId = null; });
+      _busTimeCtrl.clear(); _busArrCtrl.clear(); _busFareCtrl.clear();
+      setState(() { _busDrvId = null; _busRouteId = null; _busDays = 'Daily'; });
     }
     _loadAll();
   }
@@ -221,21 +229,20 @@ setState(() {
   }
 
   // ── Route actions ──────────────────────────────────────────────────────────
+  // A route is now just the source/destination city pair — timing and fare
+  // belong to each bus/transport assigned to it.
   Future<void> _addRoute() async {
-    if ([_routeSrcCtrl,_routeDstCtrl,_routeTimeCtrl,_routeFareCtrl]
-        .any((c) => c.text.trim().isEmpty)) {
-      _snack('All route fields required.', error: true); return;
+    if ([_routeSrcCtrl,_routeDstCtrl].any((c) => c.text.trim().isEmpty)) {
+      _snack('Source and destination are required.', error: true); return;
     }
     final res = await _api.adminAddRoute(
       source: _routeSrcCtrl.text.trim(),
-      destination: _routeDstCtrl.text.trim(), departureTime: _routeTimeCtrl.text.trim(),
-      arrivalTime: _routeArrCtrl.text.trim().isEmpty ? null : _routeArrCtrl.text.trim(),
-      daysOfWeek: _routeDays, fare: double.tryParse(_routeFareCtrl.text.trim()) ?? 0,
+      destination: _routeDstCtrl.text.trim(),
     );
-    _snack(res['message'] ?? 'Done.', error: res['status'] != 'success');
+    _snack(res['message'] ?? 'Route created — add a bus/transport to it below with its own timing and fare.',
+        error: res['status'] != 'success');
     if (res['status'] == 'success') {
-      for (final c in [_routeSrcCtrl,_routeDstCtrl,_routeTimeCtrl,_routeArrCtrl,_routeFareCtrl]) c.clear();
-      setState(() { _routeDays = 'Daily'; });
+      for (final c in [_routeSrcCtrl,_routeDstCtrl]) c.clear();
     }
     _loadAll();
   }
@@ -275,7 +282,10 @@ setState(() {
     final paymentOk = paymentStatus == 'paid' ||
         paymentStatus == 'success' ||
         paymentStatus == 'confirmed';
-    final bookingOk = bookingStatus != 'cancelled';
+    // Must be an actual driver-confirmed booking, not just "not cancelled"
+    // — a still-pending booking (awaiting driver confirmation) must not
+    // be downloadable as a ticket, matching the passenger-side rule.
+    final bookingOk = bookingStatus == 'confirmed';
 
     return paymentOk && bookingOk;
   }
@@ -603,6 +613,7 @@ setState(() {
     final name     = b['passengerName']  ?? 'Unknown';
     final email    = b['passengerEmail'] ?? '';
     final phone    = (b['passengerPhone'] ?? '').toString();
+    final gender   = (b['passengerGender'] ?? '').toString();
     final amount   = _toDouble(b['amount']);
 
     return Card(
@@ -622,7 +633,13 @@ setState(() {
             ),
             const SizedBox(width: 10),
             Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text(name, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+              Row(children: [
+                Flexible(child: Text(name, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14), overflow: TextOverflow.ellipsis)),
+                if (gender.isNotEmpty) ...[
+                  const SizedBox(width: 6),
+                  _genderBadge(gender),
+                ],
+              ]),
               if (email.isNotEmpty)
                 Text(email, style: const TextStyle(fontSize: 10, color: Colors.grey)),
               if (phone.isNotEmpty)
@@ -778,6 +795,18 @@ setState(() {
                 onChanged: (v) => setState(() => _busDrvId = v),
                 decoration: const InputDecoration(labelText: 'Driver'),
               ),
+              const SizedBox(height: 6),
+              const Text('This transport\'s own schedule & price', style: TextStyle(fontSize: 11, color: Colors.grey)),
+              TextField(controller: _busTimeCtrl, decoration: const InputDecoration(labelText: 'Departure Time (HH:MM:SS)')),
+              TextField(controller: _busArrCtrl,  decoration: const InputDecoration(labelText: 'Arrival Time (HH:MM:SS) — optional')),
+              DropdownButtonFormField<String>(
+                value: _busDays,
+                decoration: const InputDecoration(labelText: 'Days of Operation'),
+                items: ['Daily','Weekdays','Weekends','Mon,Wed,Fri','Tue,Thu','Mon,Tue,Wed,Thu,Fri','Sat,Sun']
+                    .map((d) => DropdownMenuItem(value: d, child: Text(d))).toList(),
+                onChanged: (v) => setState(() => _busDays = v!),
+              ),
+              TextField(controller: _busFareCtrl, decoration: const InputDecoration(labelText: 'Fare (PKR)'), keyboardType: TextInputType.number),
               const SizedBox(height: 14),
               ElevatedButton(
                 style: ElevatedButton.styleFrom(backgroundColor: Colors.indigo.shade900, foregroundColor: Colors.white),
@@ -806,7 +835,8 @@ setState(() {
                 title: Text('${b['transport_name'] ?? 'Unnamed Transport'}  •  ${b['bus_number'] ?? ''}',
                     style: const TextStyle(fontWeight: FontWeight.bold)),
                 subtitle: Text(
-                    'Route: $routeLabel\nCapacity: ${b['capacity']} • Status: ${b['status']}\nDriver: ${(((b['drivers'] ?? {})['users'] ?? {})['name'] ?? 'Unassigned')}'),
+                    'Route: $routeLabel\nDep: ${b['departure_time'] ?? '-'}${(b['arrival_time'] ?? '').toString().isNotEmpty ? "  •  Arr: ${b['arrival_time']}" : ""}  •  PKR ${_toDouble(b['fare']).toStringAsFixed(0)}\n'
+                    'Capacity: ${b['capacity']} • Status: ${b['status']} • ${b['days_of_week'] ?? 'Daily'}\nDriver: ${(((b['drivers'] ?? {})['users'] ?? {})['name'] ?? 'Unassigned')}'),
                 isThreeLine: true,
                 trailing: IconButton(icon: const Icon(Icons.delete_outline, color: Colors.red), onPressed: () => _deleteBus(b)),
               ),
@@ -845,22 +875,11 @@ setState(() {
             crossAxisAlignment: CrossAxisAlignment.stretch, children: [
               const Text('Add New Route', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
               const SizedBox(height: 12),
-              const Text('A route can have multiple buses/transports — add the route here, then assign buses to it from the Buses tab.',
+              const Text('A route is just the source/destination city pair. Add it here, then assign buses to it from the Buses tab — each bus sets its own timing and fare.',
                   style: TextStyle(fontSize: 11, color: Colors.grey)),
               const SizedBox(height: 10),
               TextField(controller: _routeSrcCtrl,  decoration: const InputDecoration(labelText: 'Source')),
               TextField(controller: _routeDstCtrl,  decoration: const InputDecoration(labelText: 'Destination')),
-              TextField(controller: _routeTimeCtrl, decoration: const InputDecoration(labelText: 'Departure Time (HH:MM:SS)')),
-              TextField(controller: _routeArrCtrl,  decoration: const InputDecoration(labelText: 'Arrival Time (HH:MM:SS) — optional')),
-              const SizedBox(height: 6),
-              DropdownButtonFormField<String>(
-                value: _routeDays,
-                decoration: const InputDecoration(labelText: 'Days of Operation'),
-                items: ['Daily','Weekdays','Weekends','Mon,Wed,Fri','Tue,Thu','Mon,Tue,Wed,Thu,Fri','Sat,Sun']
-                    .map((d) => DropdownMenuItem(value: d, child: Text(d))).toList(),
-                onChanged: (v) => setState(() => _routeDays = v!),
-              ),
-              TextField(controller: _routeFareCtrl, decoration: const InputDecoration(labelText: 'Fare (PKR)'), keyboardType: TextInputType.number),
               const SizedBox(height: 14),
               ElevatedButton(
                 style: ElevatedButton.styleFrom(backgroundColor: Colors.indigo.shade900, foregroundColor: Colors.white),
@@ -874,15 +893,16 @@ setState(() {
         const SizedBox(height: 10),
         if (_routes.isEmpty) const Center(child: Padding(padding: EdgeInsets.all(24), child: Text('No routes yet.'))),
         ..._routes.map((r) {
-          final arr  = r['arrival_time']?.toString() ?? '';
-          final dep  = r['departure_time']?.toString() ?? '-';
-          final days = r['days_of_week']?.toString() ?? 'Daily';
-          final fare = _toDouble(r['fare']);
           final busesRaw = r['buses'];
           final busList = busesRaw is List ? List<Map<String, dynamic>>.from(busesRaw) : const <Map<String, dynamic>>[];
           final busSummary = busList.isEmpty
               ? 'No buses assigned yet'
-              : busList.map((b) => b['transport_name'] ?? b['bus_number'] ?? '-').join(', ');
+              : busList.map((b) {
+                  final name = b['transport_name'] ?? b['bus_number'] ?? '-';
+                  final dep = (b['departure_time'] ?? '').toString();
+                  final fare = _toDouble(b['fare']);
+                  return '$name (${dep.isNotEmpty ? "$dep, " : ""}PKR ${fare.toStringAsFixed(0)})';
+                }).join(', ');
           return Card(
             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
             child: ListTile(
@@ -891,7 +911,6 @@ setState(() {
               title: Text('${r["source"]} → ${r["destination"]}',
                   style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
               subtitle: Text(
-                '$days\nDep: $dep${arr.isNotEmpty ? "  •  Arr: $arr" : ""}  •  PKR ${fare.toStringAsFixed(0)}\n'
                 'Buses (${busList.length}): $busSummary',
               ),
               isThreeLine: true,
@@ -1120,6 +1139,20 @@ setState(() {
     ]);
   }
 
+  Widget _genderBadge(String gender) {
+    final isMale = gender == 'Male';
+    final color = isMale ? Colors.blue : Colors.pink;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(color: color.shade50, borderRadius: BorderRadius.circular(6)),
+      child: Row(mainAxisSize: MainAxisSize.min, children: [
+        Icon(isMale ? Icons.male : Icons.female, size: 10, color: color.shade700),
+        const SizedBox(width: 2),
+        Text(gender, style: TextStyle(fontSize: 9, color: color.shade700, fontWeight: FontWeight.w600)),
+      ]),
+    );
+  }
+
   Widget _statusChip(String status) {
     Color bg, fg;
     final s = status.toLowerCase();
@@ -1164,8 +1197,8 @@ setState(() {
   @override
   void dispose() {
     for (final c in [_hireNameCtrl,_hireEmailCtrl,_hirePassCtrl,_hireLicCtrl,
-                     _busNumberCtrl,_busTransportCtrl,_busCapCtrl,_routeSrcCtrl,_routeDstCtrl,
-                     _routeTimeCtrl,_routeArrCtrl,_routeFareCtrl]) c.dispose();
+                     _busNumberCtrl,_busTransportCtrl,_busCapCtrl,_busTimeCtrl,_busArrCtrl,_busFareCtrl,
+                     _routeSrcCtrl,_routeDstCtrl]) c.dispose();
     super.dispose();
   }
 }

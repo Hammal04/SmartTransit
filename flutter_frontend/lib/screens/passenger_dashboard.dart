@@ -1,11 +1,13 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show FilteringTextInputFormatter;
+import 'dart:async';
 import 'package:provider/provider.dart';
 import '../services/auth_provider.dart';
 import '../services/api_service.dart';
 import '../models/models.dart';
 import 'login_screen.dart';
 import 'chatbot_screen.dart';
+import 'track_bus_screen.dart';
 import 'package:printing/printing.dart';
 
 class PassengerDashboard extends StatefulWidget {
@@ -27,6 +29,11 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
   int?      _selectedRouteId;
   // PKT = UTC+5. Initialise to tomorrow in Pakistan time.
   DateTime  _selectedDate    = DateTime.now().toUtc().add(const Duration(hours: 5, days: 1));
+  // "Search for Bus" panel — Departure / Arrival / Date, filtering _routes
+  // down to a shortlist the passenger picks from.
+  String?   _searchSource;
+  String?   _searchDestination;
+  bool      _hasSearched     = false;
   // A route can now be served by multiple buses/transports (e.g. Daewoo
   // Express, Faisal Movers). The passenger must pick one before seats load.
   List<Map<String, dynamic>> _routeBuses = [];
@@ -35,8 +42,16 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
   int?      _selectedSeat;
   List<int> _availableSeats  = [];
   List<int> _bookedSeats     = [];
+  // seat -> {gender, paymentStatus} for booked seats, so the seat map can
+  // colour-code Male vs Female and show a lighter shade until the driver
+  // confirms cash payment.
+  Map<int, Map<String, dynamic>> _bookedSeatDetails = {};
   int       _busCapacity     = 0;
   bool      _loadingSeats    = false;
+  // Periodically re-fetches seat availability while a bus is selected, so
+  // the seat map reflects other passengers' bookings / driver confirmations
+  // without the passenger needing to manually refresh.
+  Timer?    _seatRefreshTimer;
   bool      _booking         = false;
 
   // Passenger details form (Full Name + Phone Number) shown on the booking
@@ -45,6 +60,9 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
   final GlobalKey<FormState> _bookingFormKey = GlobalKey<FormState>();
   final TextEditingController _fullNameController = TextEditingController();
   final TextEditingController _phoneController    = TextEditingController();
+  // Selected via the Male/Female choice at seat-selection time so booked
+  // seats can be colour-coded by gender on the seat map.
+  String? _selectedGender;
 
   static final RegExp _fullNameRegex =
       RegExp(r"^[a-zA-Z\u00C0-\u017F][a-zA-Z\u00C0-\u017F .'-]{1,49}$");
@@ -72,10 +90,12 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
 
   bool get _passengerDetailsValid =>
       _validateFullName(_fullNameController.text) == null &&
-      _validatePhone(_phoneController.text) == null;
+      _validatePhone(_phoneController.text) == null &&
+      _selectedGender != null;
 
   @override
   void dispose() {
+    _seatRefreshTimer?.cancel();
     _fullNameController.removeListener(_onPassengerDetailsChanged);
     _phoneController.removeListener(_onPassengerDetailsChanged);
     _fullNameController.dispose();
@@ -137,12 +157,14 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
   // ── Load transports/buses available on the selected route ────────────────
   Future<void> _loadRouteBuses() async {
     if (_selectedRouteId == null) return;
+    _seatRefreshTimer?.cancel();
     setState(() {
       _loadingBuses   = true;
       _selectedBusId  = null;
       _selectedSeat   = null;
       _availableSeats = [];
       _bookedSeats    = [];
+      _bookedSeatDetails = {};
     });
     final buses = await _api.getRouteBuses(_selectedRouteId!);
     if (!mounted) return;
@@ -159,14 +181,34 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
   Future<void> _loadSeats() async {
     if (_selectedBusId == null) return;
     setState(() { _loadingSeats = true; _selectedSeat = null; });
+    await _refreshSeatsQuietly();
+    if (mounted) setState(() { _loadingSeats = false; });
+    // Keep the seat map current in near-real-time (e.g. another passenger
+    // books/gets confirmed, or the driver confirms/rejects a booking)
+    // without the passenger needing to manually refresh or re-pick a bus.
+    _seatRefreshTimer?.cancel();
+    _seatRefreshTimer = Timer.periodic(const Duration(seconds: 12), (_) => _refreshSeatsQuietly());
+  }
+
+  // Re-fetches seat availability without flipping the loading spinner, so
+  // periodic background refreshes don't cause the seat grid to flicker.
+  Future<void> _refreshSeatsQuietly() async {
+    if (_selectedBusId == null) return;
     final dateStr = '${_selectedDate.year}-${_selectedDate.month.toString().padLeft(2,'0')}-${_selectedDate.day.toString().padLeft(2,'0')}';
     final res = await _api.getSeatAvailability(_selectedBusId!, dateStr);
     if (!mounted) return;
     setState(() {
       _availableSeats = List<int>.from(res['available'] ?? []);
       _bookedSeats    = List<int>.from(res['booked']    ?? []);
+      final details = List<Map<String, dynamic>>.from(res['bookedDetails'] ?? []);
+      _bookedSeatDetails = { for (final d in details) (d['seat'] as int): d };
       _busCapacity    = (res['capacity'] as num?)?.toInt() ?? 0;
-      _loadingSeats   = false;
+      // If the seat this passenger had selected just got taken by someone
+      // else in the background (race with another booking), deselect it
+      // rather than letting them tap Confirm on a seat that's now gone.
+      if (_selectedSeat != null && _bookedSeats.contains(_selectedSeat)) {
+        _selectedSeat = null;
+      }
     });
     if (res['error'] != null) {
       _snack('Could not load seats: ${res['error']}', error: true);
@@ -197,6 +239,7 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
     if (_selectedRouteId == null) { _snack('Please select a route.', error: true); return; }
     if (_selectedBusId == null)   { _snack('Please select a transport/bus.', error: true); return; }
     if (_selectedSeat == null)    { _snack('Please select a seat.',  error: true); return; }
+    if (_selectedGender == null)  { _snack('Please select your gender.', error: true); return; }
 
     // Passenger details (Full Name + Phone Number) must be valid before we
     // allow booking to proceed. This does not change the existing booking
@@ -218,17 +261,20 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
       passengerId:   context.read<AuthProvider>().currentUser!.id,
       passengerName: _fullNameController.text.trim(),
       passengerPhone: _phoneController.text.trim(),
+      passengerGender: _selectedGender,
     );
     setState(() => _booking = false);
     if (!mounted) return;
 
     if (res['status'] == 'success') {
       _snack(res['message'] ?? 'Booking confirmed! Pay cash to the driver.', success: true);
+      _seatRefreshTimer?.cancel();
       setState(() {
         _selectedRouteId = null; _selectedBusId = null; _routeBuses = [];
-        _selectedSeat = null; _availableSeats = []; _bookedSeats = [];
+        _selectedSeat = null; _availableSeats = []; _bookedSeats = []; _bookedSeatDetails = {};
         _fullNameController.clear();
         _phoneController.clear();
+        _selectedGender = null;
       });
       _bookingFormKey.currentState?.reset();
       await _loadAll();
@@ -277,6 +323,18 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
   // comes back, and — on success — reloading `_bookings` + `_payments` and
   // calling setState so Home/Tickets/Payments all reflect the new status
   // immediately.
+  void _openTrackBus(int bookingId) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => TrackBusScreen(
+          bookingId: bookingId,
+          passengerId: context.read<AuthProvider>().currentUser!.id,
+        ),
+      ),
+    );
+  }
+
   Future<void> _cancelBooking(Map<String, dynamic> bk) async {
     final rawId = bk['id'];
     final bookingId = rawId is int ? rawId : int.tryParse(rawId?.toString() ?? '');
@@ -536,11 +594,96 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
   }
 
   // ── Tab 1: Search & Book ───────────────────────────────────────────────────
+  List<String> get _sourceOptions =>
+      _routes.map((r) => (r['source'] ?? '').toString()).where((s) => s.isNotEmpty).toSet().toList()..sort();
+  List<String> get _destinationOptions =>
+      _routes.map((r) => (r['destination'] ?? '').toString()).where((s) => s.isNotEmpty).toSet().toList()..sort();
+
+  List<Map<String, dynamic>> get _searchResults {
+    if (!_hasSearched) return _routes;
+    return _routes.where((r) {
+      final okSrc = _searchSource == null || r['source'] == _searchSource;
+      final okDst = _searchDestination == null || r['destination'] == _searchDestination;
+      return okSrc && okDst;
+    }).toList();
+  }
+
   Widget _buildSearchView() {
     final dateLabel = '${_selectedDate.day.toString().padLeft(2,'0')}/${_selectedDate.month.toString().padLeft(2,'0')}/${_selectedDate.year}';
     return SingleChildScrollView(
       padding: const EdgeInsets.all(16),
       child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        // ── Search for Bus hero panel ───────────────────────────────────────
+        Container(
+          padding: const EdgeInsets.all(20),
+          decoration: BoxDecoration(
+            color: Colors.blue.shade800,
+            borderRadius: BorderRadius.circular(20),
+          ),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('Search for Bus',
+                style: TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.w900)),
+            const SizedBox(height: 4),
+            const Text('Find the best transport for your journey!',
+                style: TextStyle(color: Colors.white70, fontSize: 13)),
+            const SizedBox(height: 16),
+            _searchField(
+              icon: Icons.north_east,
+              hint: 'Departure',
+              value: _searchSource,
+              options: _sourceOptions,
+              onChanged: (v) => setState(() => _searchSource = v),
+            ),
+            const SizedBox(height: 10),
+            _searchField(
+              icon: Icons.south_east,
+              hint: 'Arrival',
+              value: _searchDestination,
+              options: _destinationOptions,
+              onChanged: (v) => setState(() => _searchDestination = v),
+            ),
+            const SizedBox(height: 10),
+            InkWell(
+              onTap: _pickDate,
+              borderRadius: BorderRadius.circular(12),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+                decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(0.15),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Row(children: [
+                  const Icon(Icons.calendar_today, color: Colors.white70, size: 18),
+                  const SizedBox(width: 10),
+                  Text(dateLabel, style: const TextStyle(color: Colors.white, fontSize: 14)),
+                ]),
+              ),
+            ),
+            const SizedBox(height: 16),
+            Align(
+              alignment: Alignment.centerRight,
+              child: ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.white, foregroundColor: Colors.blue.shade900,
+                  padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 12),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                ),
+                icon: const Icon(Icons.search),
+                label: const Text('Search', style: TextStyle(fontWeight: FontWeight.bold)),
+                onPressed: () => setState(() => _hasSearched = true),
+              ),
+            ),
+          ]),
+        ),
+        const SizedBox(height: 20),
+        Text(_hasSearched ? 'Search Results (${_searchResults.length})' : 'All Routes (${_routes.length})',
+            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+        const SizedBox(height: 10),
+        if (_searchResults.isEmpty)
+          const Center(child: Padding(padding: EdgeInsets.all(24),
+              child: Text('No routes match that search.'))),
+        ..._searchResults.map(_buildRouteCard),
+        const SizedBox(height: 20),
         // ── Booking form ──────────────────────────────────────────────────────
         Card(
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
@@ -592,33 +735,43 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
                 ),
                 validator: _validatePhone,
               ),
+              const SizedBox(height: 12),
+              const Text('Gender', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
+              const SizedBox(height: 6),
+              Row(children: [
+                Expanded(child: _genderOption('Male', Icons.male, Colors.blue)),
+                const SizedBox(width: 10),
+                Expanded(child: _genderOption('Female', Icons.female, Colors.pink)),
+              ]),
               const SizedBox(height: 16),
-              // Route selector
-              DropdownButtonFormField<int>(
-                value: _selectedRouteId,
-                hint: const Text('Select Route'),
-                isExpanded: true,
-                items: _routes.map((r) {
-                  final src  = r['source']      ?? '';
-                  final dst  = r['destination'] ?? '';
-                  final fare = _toDouble(r['fare']);
-                  return DropdownMenuItem<int>(
-                    value: r['id'] as int,
-                    child: Text('$src → $dst  (PKR ${fare.toStringAsFixed(0)})',
-                        overflow: TextOverflow.ellipsis),
-                  );
-                }).toList(),
-                onChanged: (v) async {
-                  setState(() {
-                    _selectedRouteId = v;
-                    _selectedBusId = null; _routeBuses = [];
-                    _selectedSeat = null; _availableSeats = []; _bookedSeats = [];
-                  });
-                  if (v != null) await _loadRouteBuses();
-                },
-                decoration: const InputDecoration(labelText: 'Route'),
-              ),
-              if (_selectedRouteId != null) _buildRouteInfoBox(),
+              // Selected route — chosen from the search results above.
+              if (_selectedRouteId == null)
+                Container(
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(color: Colors.grey.shade100, borderRadius: BorderRadius.circular(10)),
+                  child: Row(children: [
+                    Icon(Icons.info_outline, color: Colors.grey.shade600, size: 18),
+                    const SizedBox(width: 8),
+                    const Expanded(child: Text('Search for a route above and tap it to continue booking.',
+                        style: TextStyle(color: Colors.grey, fontSize: 12))),
+                  ]),
+                )
+              else ...[
+                Row(children: [
+                  const Expanded(child: Text('Selected Route', style: TextStyle(fontWeight: FontWeight.bold))),
+                  TextButton(
+                    onPressed: () {
+                      _seatRefreshTimer?.cancel();
+                      setState(() {
+                        _selectedRouteId = null; _selectedBusId = null; _routeBuses = [];
+                        _selectedSeat = null; _availableSeats = []; _bookedSeats = []; _bookedSeatDetails = {};
+                      });
+                    },
+                    child: const Text('Change'),
+                  ),
+                ]),
+                _buildRouteInfoBox(),
+              ],
               const SizedBox(height: 12),
               // Bus/Transport selector — a route can be served by several
               // buses (e.g. Daewoo Express, Faisal Movers); the passenger
@@ -637,17 +790,6 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
                         : Column(children: _routeBuses.map(_buildBusOption).toList()),
                 const SizedBox(height: 12),
               ],
-              // Date picker
-              InkWell(
-                onTap: _pickDate,
-                child: InputDecorator(
-                  decoration: const InputDecoration(
-                    labelText: 'Departure Date',
-                    prefixIcon: Icon(Icons.calendar_today_outlined),
-                  ),
-                  child: Text(dateLabel, style: const TextStyle(fontSize: 15)),
-                ),
-              ),
               const SizedBox(height: 16),
               // Seat grid
               if (_selectedBusId != null) ...[
@@ -662,13 +804,17 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
                 ),
                 const SizedBox(height: 6),
                 // Legend
-                Row(children: [
-                  _seatLegend(Colors.green.shade100, Colors.green.shade700, 'Available'),
-                  const SizedBox(width: 12),
-                  _seatLegend(Colors.red.shade100, Colors.red.shade700, 'Booked'),
-                  const SizedBox(width: 12),
-                  _seatLegend(Colors.blue.shade700, Colors.white, 'Selected'),
+                Wrap(spacing: 12, runSpacing: 6, children: [
+                  _seatLegend(Colors.blue.shade50, Colors.blue.shade700, 'Available'),
+                  _seatLegend(Colors.amber.shade600, Colors.white, 'Selected'),
+                  _seatLegend(Colors.blue.shade400, Colors.white, 'Male (booked)'),
+                  _seatLegend(Colors.pink.shade400, Colors.white, 'Female (booked)'),
                 ]),
+                const Padding(
+                  padding: EdgeInsets.only(top: 4),
+                  child: Text('Lighter shade = reserved, awaiting driver confirmation',
+                      style: TextStyle(fontSize: 10, color: Colors.grey)),
+                ),
                 const SizedBox(height: 8),
                 _loadingSeats
                     ? const Center(child: Padding(padding: EdgeInsets.all(16),
@@ -691,7 +837,7 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
                           : _selectedSeat == null
                               ? 'Select a Seat to Book'
                               : !_passengerDetailsValid
-                                  ? 'Enter Valid Name & Phone Number'
+                                  ? 'Enter Valid Details (Name, Phone, Gender)'
                                   : 'Confirm Seat $_selectedSeat — Pay Cash on Boarding'),
                       onPressed: (_selectedBusId != null && _selectedSeat != null && _passengerDetailsValid)
                           ? _bookTicket
@@ -700,13 +846,43 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
             ],
           ))),
         ),
-        const SizedBox(height: 22),
-        const Text('Available Routes', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-        const SizedBox(height: 10),
-        if (_routes.isEmpty)
-          const Center(child: Padding(padding: EdgeInsets.all(24), child: Text('No routes available.'))),
-        ..._routes.map(_buildRouteCard),
       ]),
+    );
+  }
+
+  Widget _searchField({
+    required IconData icon,
+    required String hint,
+    required String? value,
+    required List<String> options,
+    required ValueChanged<String?> onChanged,
+  }) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.15),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: DropdownButtonHideUnderline(
+        child: DropdownButton<String>(
+          value: options.contains(value) ? value : null,
+          hint: Row(children: [
+            Icon(icon, color: Colors.white70, size: 18),
+            const SizedBox(width: 10),
+            Text(hint, style: const TextStyle(color: Colors.white70)),
+          ]),
+          icon: const Icon(Icons.arrow_drop_down, color: Colors.white70),
+          dropdownColor: Colors.blue.shade800,
+          isExpanded: true,
+          selectedItemBuilder: (context) => options.map((o) => Row(children: [
+            Icon(icon, color: Colors.white, size: 18),
+            const SizedBox(width: 10),
+            Text(o, style: const TextStyle(color: Colors.white)),
+          ])).toList(),
+          items: options.map((o) => DropdownMenuItem(value: o, child: Text(o))).toList(),
+          onChanged: onChanged,
+        ),
+      ),
     );
   }
 
@@ -717,6 +893,9 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
     final number = bus['bus_number'] ?? '-';
     final driver = bus['driverName'] ?? 'Not assigned';
     final capacity = bus['capacity'] ?? '-';
+    final dep = bus['departure_time']?.toString() ?? '-';
+    final arr = bus['arrival_time']?.toString() ?? '';
+    final fare = _toDouble(bus['fare']);
     return Card(
       margin: const EdgeInsets.only(bottom: 8),
       shape: RoundedRectangleBorder(
@@ -730,13 +909,21 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
         onChanged: (v) async {
           setState(() {
             _selectedBusId = v;
-            _selectedSeat = null; _availableSeats = []; _bookedSeats = [];
+            _selectedSeat = null; _availableSeats = []; _bookedSeats = []; _bookedSeatDetails = {};
           });
           if (v != null) await _loadSeats();
         },
-        title: Text(transport, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-        subtitle: Text('Bus: $number  •  Driver: $driver  •  Capacity: $capacity',
-            style: const TextStyle(fontSize: 11, color: Colors.grey)),
+        title: Row(children: [
+          Expanded(child: Text(transport, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13))),
+          Text('PKR ${fare.toStringAsFixed(0)}',
+              style: TextStyle(fontWeight: FontWeight.bold, color: Colors.blue.shade900, fontSize: 13)),
+        ]),
+        subtitle: Text(
+          'Bus: $number  •  Driver: $driver  •  Capacity: $capacity\n'
+          'Dep: $dep${arr.isNotEmpty ? "  •  Arr: $arr" : ""}',
+          style: const TextStyle(fontSize: 11, color: Colors.grey),
+        ),
+        isThreeLine: true,
       ),
     );
   }
@@ -746,11 +933,9 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
     if (r.isEmpty) return const SizedBox();
     final src  = r['source']         ?? '';
     final dst  = r['destination']    ?? '';
-    final days = r['days_of_week']   ?? 'Daily';
-    final dep  = r['departure_time'] ?? '-';
-    final arr  = r['arrival_time']?.toString() ?? '';
-    final fare = _toDouble(r['fare']);
     final busCount = (r['busCount'] as int?) ?? _routeBuses.length;
+    final minFare = r['minFare'] as double?;
+    final earliestDep = r['earliestDeparture']?.toString();
     return Container(
       margin: const EdgeInsets.only(top: 10),
       padding: const EdgeInsets.all(12),
@@ -758,45 +943,117 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
       child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
         Text('$src → $dst', style: const TextStyle(fontWeight: FontWeight.bold)),
         Text('$busCount transport${busCount == 1 ? '' : 's'} available on this route'),
-        Text('Days: $days', style: const TextStyle(fontWeight: FontWeight.w600, color: Colors.blue)),
-        Text('Dep: $dep${arr.isNotEmpty ? "  •  Arr: $arr" : ""}'),
-        Text('PKR ${fare.toStringAsFixed(0)} per seat',
-            style: TextStyle(color: Colors.blue.shade900, fontWeight: FontWeight.bold)),
+        if (earliestDep != null) Text('Earliest departure: $earliestDep'),
+        if (minFare != null)
+          Text('From PKR ${minFare.toStringAsFixed(0)} per seat',
+              style: TextStyle(color: Colors.blue.shade900, fontWeight: FontWeight.bold)),
+        const Text('Price and timing vary by transport — pick one below.',
+            style: TextStyle(fontSize: 11, color: Colors.grey)),
       ]),
     );
   }
 
+  // Bus-shaped 2+2 seat map: steering wheel up front, two seats on the
+  // left, an aisle gap, two seats on the right — matching a real coach
+  // layout. Seat numbers stay sequential (1..capacity, left-to-right,
+  // front-to-back) to match how the backend already numbers seats.
   Widget _buildSeatGrid() {
-    return GridView.builder(
-      shrinkWrap: true,
-      physics: const NeverScrollableScrollPhysics(),
-      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-        crossAxisCount: 8, mainAxisSpacing: 6, crossAxisSpacing: 6, childAspectRatio: 1,
+    final rows = (_busCapacity / 4).ceil();
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 14),
+      decoration: BoxDecoration(
+        border: Border.all(color: Colors.grey.shade300),
+        borderRadius: BorderRadius.circular(12),
       ),
-      itemCount: _busCapacity,
-      itemBuilder: (_, i) {
-        final seat     = i + 1;
-        final isBooked = _bookedSeats.contains(seat);
-        final isSelected = _selectedSeat == seat;
-        Color bg, fg;
-        if (isSelected) { bg = Colors.blue.shade700; fg = Colors.white; }
-        else if (isBooked) { bg = Colors.red.shade100; fg = Colors.red.shade700; }
-        else { bg = Colors.green.shade100; fg = Colors.green.shade800; }
-        return GestureDetector(
-          onTap: isBooked ? null : () => setState(() => _selectedSeat = isSelected ? null : seat),
-          child: Container(
-            decoration: BoxDecoration(
-              color: bg,
-              borderRadius: BorderRadius.circular(6),
-              border: isSelected ? Border.all(color: Colors.blue.shade900, width: 2) : null,
-            ),
-            child: Center(
-              child: Text('$seat',
-                  style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: fg)),
+      child: Column(children: [
+        Icon(Icons.airline_seat_recline_normal, color: Colors.grey.shade400, size: 22),
+        const SizedBox(height: 2),
+        Text('FRONT', style: TextStyle(fontSize: 9, color: Colors.grey.shade400, letterSpacing: 1)),
+        const SizedBox(height: 10),
+        for (var row = 0; row < rows; row++)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 4),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                _seatSlot(row * 4 + 1),
+                const SizedBox(width: 6),
+                _seatSlot(row * 4 + 2),
+                const SizedBox(width: 22), // aisle
+                _seatSlot(row * 4 + 3),
+                const SizedBox(width: 6),
+                _seatSlot(row * 4 + 4),
+              ],
             ),
           ),
-        );
-      },
+      ]),
+    );
+  }
+
+  Widget _seatSlot(int seat) {
+    if (seat > _busCapacity) return const SizedBox(width: 34, height: 34);
+    final isBooked = _bookedSeats.contains(seat);
+    final isSelected = _selectedSeat == seat;
+    Color bg, fg, border;
+    if (isSelected) {
+      bg = Colors.amber.shade600; fg = Colors.white; border = Colors.amber.shade800;
+    } else if (isBooked) {
+      // Colour-coded by the passenger's gender; a lighter shade until the
+      // driver actually confirms the cash payment, solid once confirmed —
+      // so "Booked" only reads as fully booked after driver confirmation.
+      final details = _bookedSeatDetails[seat];
+      final gender = details?['gender'] as String?;
+      final isConfirmed = (details?['bookingStatus'] as String?) == 'confirmed';
+      final MaterialColor base = gender == 'Male'
+          ? Colors.blue
+          : gender == 'Female'
+              ? Colors.pink
+              : Colors.grey;
+      bg = isConfirmed ? base.shade400 : base.shade100;
+      fg = isConfirmed ? Colors.white : base.shade700;
+      border = base.shade300;
+    } else {
+      bg = Colors.blue.shade50; fg = Colors.blue.shade700; border = Colors.blue.shade200;
+    }
+    return GestureDetector(
+      onTap: isBooked ? null : () => setState(() => _selectedSeat = isSelected ? null : seat),
+      child: Container(
+        width: 34, height: 34,
+        decoration: BoxDecoration(
+          color: bg,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: border),
+        ),
+        child: Stack(alignment: Alignment.center, children: [
+          Icon(Icons.event_seat, size: 18, color: fg),
+          Positioned(
+            bottom: 1,
+            child: Text('$seat', style: TextStyle(fontSize: 7, fontWeight: FontWeight.bold, color: fg)),
+          ),
+        ]),
+      ),
+    );
+  }
+
+  Widget _genderOption(String value, IconData icon, MaterialColor color) {
+    final isSelected = _selectedGender == value;
+    return GestureDetector(
+      onTap: () => setState(() => _selectedGender = value),
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 12),
+        decoration: BoxDecoration(
+          color: isSelected ? color.shade50 : Colors.grey.shade50,
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: isSelected ? color.shade600 : Colors.grey.shade300, width: isSelected ? 2 : 1),
+        ),
+        child: Column(children: [
+          Icon(icon, color: isSelected ? color.shade700 : Colors.grey.shade500),
+          const SizedBox(height: 2),
+          Text(value, style: TextStyle(
+              fontSize: 12, fontWeight: FontWeight.w600,
+              color: isSelected ? color.shade800 : Colors.grey.shade600)),
+        ]),
+      ),
     );
   }
 
@@ -804,8 +1061,8 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
     return Row(mainAxisSize: MainAxisSize.min, children: [
       Container(
         width: 16, height: 16,
-        decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(3)),
-        child: Center(child: Text('1', style: TextStyle(fontSize: 8, color: fg))),
+        decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(4)),
+        child: Icon(Icons.event_seat, size: 11, color: fg),
       ),
       const SizedBox(width: 4),
       Text(label, style: const TextStyle(fontSize: 10, color: Colors.grey)),
@@ -815,11 +1072,9 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
   Widget _buildRouteCard(Map<String, dynamic> r) {
     final src  = r['source']         ?? '';
     final dst  = r['destination']    ?? '';
-    final days = r['days_of_week']   ?? 'Daily';
-    final dep  = r['departure_time'] ?? '-';
-    final arr  = r['arrival_time']?.toString() ?? '';
     final busCount = (r['busCount'] as int?) ?? 0;
-    final fare = _toDouble(r['fare']);
+    final minFare = r['minFare'] as double?;
+    final earliestDep = r['earliestDeparture']?.toString();
     return Card(
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       child: ListTile(
@@ -830,12 +1085,15 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
         title: Text('$src → $dst',
             style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
         subtitle: Text(
-          '$days\n$busCount transport${busCount == 1 ? '' : 's'} available  •  Dep: $dep${arr.isNotEmpty ? "  Arr: $arr" : ""}',
+          '$busCount transport${busCount == 1 ? '' : 's'} available'
+          '${earliestDep != null ? "  •  Earliest: $earliestDep" : ""}',
           style: const TextStyle(fontSize: 11),
         ),
-        trailing: Text('PKR ${fare.toStringAsFixed(0)}',
-            style: TextStyle(fontWeight: FontWeight.bold, color: Colors.blue.shade900)),
-        isThreeLine: true,
+        trailing: minFare != null
+            ? Text('From PKR ${minFare.toStringAsFixed(0)}',
+                style: TextStyle(fontWeight: FontWeight.bold, color: Colors.blue.shade900, fontSize: 12))
+            : null,
+        isThreeLine: false,
         onTap: () async {
           setState(() { _selectedRouteId = r['id'] as int; _tabIndex = 1; });
           await _loadRouteBuses();
@@ -900,17 +1158,16 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
     final src = routeData?['source'] ?? '';
     final dst = routeData?['destination'] ?? '';
 
-    final dep = routeData?['departure_time'] ?? '-';
-    final arr = routeData?['arrival_time']?.toString() ?? '';
-
     final busData = bk['buses'] as Map<String, dynamic>?;
     final bus = busData?['bus_number'] ?? '-';
     final transport = busData?['transport_name'] ?? '';
 
-    final amount = _toDouble(routeData?['fare']);
+    final dep = busData?['departure_time'] ?? '-';
+    final arr = busData?['arrival_time']?.toString() ?? '';
+
+    final amount = _toDouble(payment?['amount']);
     final seat = bk['seat_number'] ?? '-';
     final depDate = bk['departure_date'] ?? '';
-    final days = routeData?['days_of_week'] ?? '';
 
     final rawId = bk['id'];
     final bookingId = rawId is int ? rawId : int.tryParse(rawId?.toString() ?? '');
@@ -961,9 +1218,6 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
                 ),
               ]),
             ),
-          if (days.toString().isNotEmpty)
-            Text(days.toString(),
-                style: const TextStyle(fontSize: 10, color: Colors.blue, fontWeight: FontWeight.w600)),
           Text(
             '${transport.toString().isNotEmpty ? "$transport ($bus)" : "Bus: $bus"}  •  Seat: $seat  •  Dep: $dep${arr.isNotEmpty ? "  •  Arr: $arr" : ""}',
             style: const TextStyle(fontSize: 11, color: Colors.grey),
@@ -1019,6 +1273,20 @@ class _PassengerDashboardState extends State<PassengerDashboard> {
                             width: 12, height: 12,
                             child: CircularProgressIndicator(strokeWidth: 2))
                         : const Text('Cancel'),
+                  ),
+                if (isConfirmed && !isCancelled && bookingId != null &&
+                    depDate.toString() == '${_pktNow.year}-${_pktNow.month.toString().padLeft(2,'0')}-${_pktNow.day.toString().padLeft(2,'0')}')
+                  OutlinedButton.icon(
+                    style: OutlinedButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                      visualDensity: VisualDensity.compact,
+                      textStyle: const TextStyle(fontSize: 12),
+                      foregroundColor: Colors.teal.shade800,
+                      side: BorderSide(color: Colors.teal.shade300),
+                    ),
+                    onPressed: () => _openTrackBus(bookingId),
+                    icon: const Icon(Icons.gps_fixed, size: 16),
+                    label: const Text('Track My Bus'),
                   ),
               ],
             ),
