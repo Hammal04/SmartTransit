@@ -1,20 +1,48 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
-</div>
+# 🚌 SmartTransit
 
-# Run and deploy your AI Studio app
+> A modern smart transportation management platform designed to simplify bus tracking, route management, and passenger bookings.
 
-This contains everything you need to run your app locally.
+SmartTransit is a full-stack transportation solution that connects passengers, transport operators, and administrators through a centralized digital platform. The system provides tools for managing transportation services while delivering a convenient experience through a Flutter-based application.
 
-View your app in AI Studio: https://ai.studio/apps/37cfb20f-fe54-4b65-9f60-53141e653227
+---
 
-## Run Locally
+## 📌 Overview
 
-**Prerequisites:**  Node.js
+Managing transportation services manually can lead to difficulties in tracking vehicles, managing routes, and handling passenger bookings.
 
+**SmartTransit** addresses these challenges by providing a digital transportation management system with a dedicated frontend, backend API, and database infrastructure.
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+The platform is designed to support features such as:
+
+- 🚌 Bus and vehicle management
+- 📍 Live vehicle tracking
+- 🗺️ Route management
+- 🎫 Passenger booking
+- 👥 User management
+- 🔐 Authentication and authorization
+- 📊 Administrative management
+
+---
+
+## 🏗️ Project Architecture
+
+SmartTransit follows a full-stack architecture:
+
+```text
+                    ┌───────────────────┐
+                    │   Flutter App     │
+                    │     Frontend      │
+                    └─────────┬─────────┘
+                              │
+                              │ API Requests
+                              ▼
+                    ┌───────────────────┐
+                    │   Node.js Server  │
+                    │      Backend      │
+                    └─────────┬─────────┘
+                              │
+                              │
+                              ▼
+                    ┌───────────────────┐
+                    │     Database      │
+                    └───────────────────┘
