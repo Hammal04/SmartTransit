@@ -277,7 +277,7 @@ This project is intended for educational and development purposes.
 **Hammal Baloch**
 
 - GitHub: [github.com/Hammal04](https://github.com/Hammal04)
-- LinkedIn: [linkedin.com/Hammal9] (https://www.linkedin.com/in/hammal9)
+- LinkedIn: https://www.linkedin.com/in/hammal9
 
 ---
 
